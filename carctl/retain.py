@@ -175,7 +175,7 @@ def _is_ancestor(repo: str, a: str, b: str) -> bool:
 
 
 def git_version(repo: str) -> tuple[int, ...]:
-    """(major, minor) of the git on PATH, or () if it will not say."""
+    """The leading numeric fields of `git version`, or () if it will not say."""
     parts = _out(repo, "version").split()
     if len(parts) < 3:
         return ()
@@ -231,8 +231,9 @@ def refresh_commit_graph(repo: str) -> str:
             # Loud, because the alternative is a repository that reports
             # itself broken from now on for a reason nobody watched happen.
             raise MaintenanceError(
-                f"the commit-graph at {path} names commits this prune "
-                f"removed and could not be deleted: {exc}") from exc
+                f"the stale commit-graph at {path} could not be deleted: "
+                f"{exc}. Left in place it names commits that are gone, and "
+                "git fsck reports that as a broken repository") from exc
     if _is_shallow(repo):
         return ("commit-graph dropped, not rebuilt: git does not write one "
                 "for a shallow repository")
@@ -311,9 +312,9 @@ def unrecorded_promotions(repo: str, cut: str,
     match, and blaming an old incident with a promotion that had not happened
     yet is the confident wrong answer this whole split exists to avoid.
     """
-    parents = _out(repo, "rev-list", "--max-parents=1", "--max-count=1",
-                   cut).strip()
-    if not parents:
+    has_parent = _out(repo, "rev-list", "--max-parents=1", "--max-count=1",
+                      cut).strip()
+    if not has_parent:
         return []                      # cut is the root; nothing is dropped
     raw = _git(repo, "log", "--format=%x01%H %ct", "--raw", "--no-abbrev",
                "--no-renames", f"{cut}^", "--", "models.json")
@@ -414,10 +415,23 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
         _out(repo, "update-ref", "-d", name)
     # The shallow boundary. `git repack` honours it, unlike a replace-ref
     # graft, so the dropped commits actually leave the pack.
-    with open(os.path.join(_out(repo, "rev-parse", "--absolute-git-dir").strip(),
-                           "shallow"), "w", encoding="utf-8",
-              newline="\n") as fh:
-        fh.write(cut + "\n")
+    shallow = os.path.join(
+        _out(repo, "rev-parse", "--absolute-git-dir").strip(), "shallow")
+    # Added, not replaced. A repo can already be shallow for a reason
+    # that is not ours, a --depth clone among them, and dropping
+    # somebody else's boundary leaves git expecting parents that are not
+    # there. A stale entry for a commit that is gone is ignored, so
+    # keeping one costs nothing.
+    have = []
+    try:
+        with open(shallow, encoding="utf-8") as fh:
+            have = [line.strip() for line in fh if line.strip()]
+    except OSError:
+        pass
+    if cut not in have:
+        have.append(cut)
+    with open(shallow, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(line + "\n" for line in have))
     # public is a scrubbed copy of main and inherits its retention. Rebuilt
     # rather than deleted, because leaving a full-length copy of the frames we
     # just dropped on another ref reclaims nothing.
