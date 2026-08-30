@@ -59,9 +59,19 @@ class Committer:
             try:
                 self.q.get_nowait()      # drop oldest
                 self.dropped += 1
+            except queue.Empty:
+                # The committer drained the queue between the failed put and
+                # this get, so there is room now and nothing needs evicting.
+                # Catching Empty together with Full counted a drop here and
+                # then discarded the frame we were handed -- dropping the
+                # NEWEST into a queue that had just emptied. That is the
+                # reverse of the documented policy, and the newest frame is
+                # the one closest to whatever caused the stall.
+                pass
+            try:
                 self.q.put_nowait(frame)
-            except (queue.Empty, queue.Full):
-                self.dropped += 1
+            except queue.Full:
+                self.dropped += 1        # refilled again; this frame is lost
 
     # ---- committer-thread side ---------------------------------------------
     def start(self) -> None:
@@ -154,8 +164,12 @@ class Committer:
         if self._proc:
             self._proc.wait(timeout=30)
             if self._proc.returncode != 0 or self.error:
+                # Formatted separately. Concatenating the two branches glued
+                # the exit code onto the errno text, so a broken pipe on exit
+                # 2 read "fast-import failed ([Errno 32] Broken pipe2)".
+                why = (repr(self.error) if self.error
+                       else f"exit {self._proc.returncode}")
                 raise RuntimeError(
-                    f"fast-import failed ({self.error or 'exit '}"
-                    f"{self._proc.returncode}): {self._stderr_text()}")
+                    f"fast-import failed ({why}): {self._stderr_text()}")
         if self._stderr:
             self._stderr.close()
