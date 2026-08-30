@@ -57,8 +57,16 @@ def cmd_incident(args):
     if not hit:
         print(f"no {args.kind} in this drive"); return
     frame, inc = hit
-    log = _git("log", "--format=%H", "--reverse").splitlines()
-    csha = log[frame.seq] if frame.seq < len(log) else "HEAD"
+    # frame.seq counts within one drive, so it can only index that drive's
+    # commits. Indexing the repo-wide log sent every incident to a commit from
+    # the first drive once a second drive existed.
+    n_frames = int(args.seconds / 0.1)
+    log = _git("log", "--format=%H", f"--max-count={n_frames}",
+               "--reverse", "refs/heads/main").splitlines()
+    if frame.seq >= len(log):
+        print(f"seq {frame.seq} is outside the last {len(log)} commits; "
+              "run a drive first"); return
+    csha = log[frame.seq]
 
     print(f"INCIDENT  {inc.kind}  seq {inc.seq}  commit {csha[:10]}")
     print(f"  {inc.detail}")
@@ -75,9 +83,12 @@ def cmd_incident(args):
     print(f"  return path: {verdict.cost_m:.1f} m")
     print()
     wt = os.path.join(REPO, ".control")
-    out = safety.record_revert(REPO, csha, wt, f"Incident: {inc.kind} ({inc.detail})")
-    print(f"record revert -> {out[:10] if len(out)==40 else out}")
-    print("  (record plane only; the physical world was not walked back)")
+    rr = safety.record_revert(REPO, csha, wt,
+                              f"Incident: {inc.kind} ({inc.detail})")
+    status = "ok" if rr.ok else "FAILED"
+    print(f"record revert -> {status}  {rr.sha[:10]}  {rr.detail}")
+    if rr.ok and not rr.already:
+        print("  (record plane only; the physical world was not walked back)")
 
 
 def cmd_park(args):

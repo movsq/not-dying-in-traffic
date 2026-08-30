@@ -19,7 +19,7 @@ without it is just an unplanned manoeuvre with a reassuring name.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-import json, math, subprocess
+import json, math, os, subprocess
 from .state import Frame
 
 MAX_LAT_OFFSET = 1.75   # m from lane centre before we call it off-road
@@ -110,23 +110,68 @@ def physical_revert(repo: str, sha: str, now: Frame) -> RevertVerdict:
     return reachable(now, json.loads(parent_state.stdout))
 
 
-def record_revert(repo: str, sha: str, worktree: str, note: str) -> str:
-    """The record-plane half. Runs in a detached control worktree so it can
-    never race the fast-import stream writing to refs/heads/main."""
-    subprocess.run(["git", "worktree", "add", "--detach", "-f", worktree, sha],
-                   cwd=repo, capture_output=True, text=True, encoding="utf-8")
-    r = subprocess.run(
-        ["git", "revert", "--no-edit", "-n", sha],
-        cwd=worktree, capture_output=True, text=True, encoding="utf-8")
-    if r.returncode != 0:
-        return f"record revert conflicted: {r.stderr.strip()[:300]}"
-    subprocess.run(["git", "commit", "-m",
-                    f'revert: "{_subject(repo, sha)}"\n\n{note}\n\n'
-                    f"This reverts commit {sha}."],
-                   cwd=worktree, capture_output=True, text=True, encoding="utf-8")
-    out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree,
-                         capture_output=True, text=True, encoding="utf-8")
-    return out.stdout.strip()
+@dataclass
+class RecordRevert:
+    ok: bool
+    sha: str = ""
+    detail: str = ""
+    already: bool = False
+
+
+def _rev(repo: str, rev: str) -> str:
+    return subprocess.run(["git", "rev-parse", "--verify", "--quiet", rev],
+                          cwd=repo, capture_output=True, text=True,
+                          encoding="utf-8").stdout.strip()
+
+
+def record_revert(repo: str, sha: str, worktree_root: str,
+                  note: str) -> RecordRevert:
+    """The record-plane half. Runs in a throwaway detached worktree so it can
+    never race the fast-import stream writing to refs/heads/main.
+
+    Every step is checked. The earlier version discarded three exit codes in a
+    row, so a second run against an already-reverted tree printed the old sha
+    and looked like a fresh revert. It also left the revert commit on a
+    detached HEAD in a scratch directory, reachable from nothing, so anchor it
+    under refs/reverts/<original> before the worktree goes away.
+    """
+    full = _rev(repo, sha)
+    if not full:
+        return RecordRevert(False, detail=f"cannot resolve {sha}")
+    ref = f"refs/reverts/{full}"
+    existing = _rev(repo, ref)
+    if existing:
+        return RecordRevert(True, existing, f"already recorded at {ref}",
+                            already=True)
+
+    wt = os.path.join(worktree_root, full[:12])
+    add = subprocess.run(["git", "worktree", "add", "--detach", "-f", wt, full],
+                         cwd=repo, capture_output=True, text=True,
+                         encoding="utf-8")
+    if add.returncode != 0:
+        return RecordRevert(False, detail=f"worktree: {add.stderr.strip()[:300]}")
+    try:
+        rv = subprocess.run(["git", "revert", "--no-edit", "-n", full], cwd=wt,
+                            capture_output=True, text=True, encoding="utf-8")
+        if rv.returncode != 0:
+            return RecordRevert(False,
+                                detail=f"conflicted: {rv.stderr.strip()[:300]}")
+        msg = "\n\n".join([f'revert: "{_subject(repo, full)}"', note,
+                           f"This reverts commit {full}."])
+        cm = subprocess.run(["git", "commit", "-m", msg], cwd=wt,
+                            capture_output=True, text=True, encoding="utf-8")
+        if cm.returncode != 0:
+            return RecordRevert(
+                False, detail=f"commit: {(cm.stderr or cm.stdout).strip()[:300]}")
+        new = _rev(wt, "HEAD")
+        subprocess.run(["git", "update-ref", ref, new], cwd=repo,
+                       capture_output=True)
+        return RecordRevert(True, new, f"recorded at {ref}")
+    finally:
+        # The checkout is a regenerable artifact; the commit it produced is
+        # already anchored by the ref above.
+        subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=repo,
+                       capture_output=True)
 
 
 def _subject(repo: str, sha: str) -> str:
