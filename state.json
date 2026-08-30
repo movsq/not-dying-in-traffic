@@ -1,14 +1,14 @@
 {
- "maneuver": "brake",
+ "maneuver": "turn_left",
  "pose": {
   "heading": 0.0,
   "steer": 0.0,
-  "v": 8.9,
+  "v": 8.5,
   "x": 25.0,
   "y": 0.0
  },
  "reversible": true,
- "road": "Vinohradsk\u00e1",
- "seq": 24,
+ "road": "Je\u010dn\u00e1",
+ "seq": 25,
  "t_mono_ns": 0
 }
