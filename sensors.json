@@ -3,9 +3,9 @@
  "lane_ref": "Je\u010dn\u00e1:1",
  "lateral_offset": -0.8,
  "lidar_min_bearing": -0.4,
- "lidar_min_range": 10.5,
+ "lidar_min_range": 9.8,
  "lidar_min_range_rear": 40.0,
- "light_distance": 0.0,
+ "light_distance": -25.0,
  "light_state": "red",
  "stop_line_crossed": false,
  "wheel_slip": 0.11
