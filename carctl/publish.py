@@ -32,6 +32,8 @@ import json
 import re
 import subprocess
 
+from . import lineage
+
 GRID_M = 25.0    # pose quantisation
 TIME_Q = 60      # commit timestamp quantisation, seconds
 
@@ -384,15 +386,26 @@ def audit(repo: str, ref: str = "refs/heads/public") -> list[str]:
 
 
 def push(repo: str, remote: str = "origin") -> tuple[bool, str]:
-    """Push the public ref only. The refspec is pinned in .git/config too, so
-    a bare `git push` cannot reach main by accident."""
+    """Push the public ref, and lineage alongside it. The refspec is pinned in
+    .git/config too, so a bare `git push` cannot reach main by accident.
+
+    Lineage goes because it is publishable by construction: it was designed to
+    carry no pose precisely so it could be kept forever, and a clone without
+    it answers every blame from the provisional main path -- shipping the
+    scrubbed frames while withholding the one ref that explains them would
+    publish the puzzle and keep the answer.
+    """
     try:
         problems = audit(repo)
     except AuditError as exc:
         return False, f"audit could not complete, nothing pushed: {exc}"
     if problems:
         return False, "audit failed, nothing pushed:\n  " + "\n  ".join(problems)
+    refspecs = ["refs/heads/public:refs/heads/main"]
+    if subprocess.run(["git", "rev-parse", "--verify", "--quiet", lineage.REF],
+                      cwd=repo, capture_output=True).returncode == 0:
+        refspecs.append(f"{lineage.REF}:{lineage.REF}")
     r = subprocess.run(
-        ["git", "push", remote, "refs/heads/public:refs/heads/main"],
+        ["git", "push", remote, *refspecs],
         cwd=repo, capture_output=True, text=True, encoding="utf-8", timeout=180)
     return r.returncode == 0, (r.stderr or r.stdout).strip()

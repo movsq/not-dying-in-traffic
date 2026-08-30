@@ -9,8 +9,8 @@ off the end of history and lands on the oldest surviving commit, which is a
 confident wrong answer: worse than no answer, and exactly the failure blame
 exists to prevent.
 
-Eighteen months of full frames would be about 105 GB at the measured floor of
-238.8 bytes per frame, and the floor is soft. So retention splits by file
+Eighteen months of full frames would be about 121 GB at the measured floor of
+255.1 bytes per frame, and the floor is soft. So retention splits by file
 rather than by time. models.json gets its own ref carrying that one file, one
 commit per promotion. Four subsystems promoting maybe weekly is a rounding
 error of disk, and it turns the retention window into a non-question for the

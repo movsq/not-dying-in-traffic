@@ -18,7 +18,7 @@ def _commit_for_seq(seq: int) -> tuple[str, str]:
 
     Returns (sha, error). Indexing `git log --max-count=<seconds/0.1>`
     positionally assumed every drive was exactly as long as the flag passed to
-    THIS command. Real drive lengths on this repo run 280, 140, 60, 30, so the
+    THIS command. Real drive lengths on this repo run 280, 170, 60, so the
     index landed inside a previous drive -- and that wrong sha was then
     blamed, and record-reverted, against a frame that had no incident. The
     Seq: trailer is already in every message; read it.

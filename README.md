@@ -37,7 +37,7 @@ There are two planes and they are allowed to disagree.
 milliseconds, with a tail you cannot bound. Nothing like that belongs inside a
 100 ms safety deadline, so the loop never calls git at all. It puts a frame on
 a bounded queue and gets on with driving. That enqueue costs 25 us in the worst
-case I measured over a 140 frame drive.
+case I measured over a 170 frame drive.
 
 A committer thread drains the queue into one long-lived `git fast-import`
 process, which appends commits over a pipe and never touches the index or a
@@ -58,6 +58,15 @@ put, and if the committer drained the queue in between, the get raised `Empty`
 and the handler threw away the frame it had just been handed, into a queue that
 was now empty. So it dropped the newest frame, which is the one closest to
 whatever caused the stall, and counted it the same way.
+
+The committer can also die politely now. A lineage ref whose `models.json` was
+a superset of the frame's -- a retired subsystem, or even a formatting
+difference -- used to raise inside the drain thread at frame 0, which killed it
+silently: the drive ran to completion, committed nothing, and said so only in
+an unrelated-looking error at the end. A formatting-only difference is not a
+promotion and now just updates the comparison blob; a retirement is recorded
+as one, because the ref that is never pruned has to be able to say a subsystem
+stopped existing.
 
 ## What each frame commits
 
@@ -92,9 +101,9 @@ through the turn peaks at 0.38 m against the 1.75 m threshold.
 
 ```
 seq 24  lat +0.000  ref Vinohradská:0            approaching
-seq 32  lat -0.375  ref Vinohradská:0>Hlavní:0   mid turn, worst tracking error
-seq 50  lat +0.094  ref Vinohradská:0>Hlavní:0   settling onto the exit lane
-seq 60  lat +0.425  ref Hlavní:0                 back on a straight centreline
+seq 32  lat -0.375  ref Vinohradská:0>Ječná:0    mid turn, worst tracking error
+seq 50  lat +0.094  ref Vinohradská:0>Ječná:0    settling onto the exit lane
+seq 60  lat +0.425  ref Ječná:0                  back on a straight centreline
 ```
 
 Parking is now the only manoeuvre with no reference path, because it leaves
@@ -109,10 +118,10 @@ format. The `!` marker keeps its real meaning. It means the frame is
 irreversible, so the history stops being invertible from there on.
 
 ```
-feat: turned left onto Hlavní
-feat: continued along Hlavní at 43 km/h
-feat!: continued along Hlavní at 43 km/h     <- stop line crossed
-chore!: parallel parking on Hlavní           <- curb strike
+feat: turned left onto Ječná
+feat: continued along Ječná at 43 km/h
+feat!: continued along Ječná at 43 km/h     <- stop line crossed
+chore!: parallel parking on Ječná           <- curb strike
 ```
 
 Reversibility gets decided when the frame is captured, by code that can see the
@@ -186,18 +195,21 @@ the commit that last changed that specific checkpoint. For a car that swaps
 models over the air mid-drive, that commit is the moment the bad model shipped.
 
 ```
-INCIDENT  red_light_run  seq 110  commit e7513a8aee
+INCIDENT  red_light_run  seq 110  commit ef65f8ce52
   crossed stop line at 43 km/h while perception reported 'green'
+  subject: feat!: continued along Ječná at 43 km/h
 
 git blame ->
   subsystem                    perception
   models_json_line             3
   promoted_on_ref              refs/heads/lineage
-  promoted_in                  16e16714803a594eefaba95d87cea484f0ff1993
+  promoted_in                  80448912994a3768d1092cec9e93a8cf7724df72
+  promoted_at_unix             1788133336
   promoted_by_commit_subject   promote perception to ckpt-perception-2026.07.14-a91f
   checkpoint                   ckpt-perception-2026.07.14-a91f
-  promoted_during_drive        drive-0010
-  provenance                   shadow_km 9100, gate is 250000, promoted anyway
+  promoted_during_drive        drive-0006
+  provenance                   trained 2026-07-14, dataset eu-urban-v12+synthetic-lowsun,
+                               shadow_km 9100 of a 250000 km gate, promoted anyway, ...
 ```
 
 Fifty commits and five seconds before the car ran the light, an OTA agent
@@ -209,26 +221,34 @@ That blame runs on `refs/heads/lineage`, not on `main`. `main` has a retention
 window and the promotion being looked for is routinely older than it, so a
 `main` sha here would be an answer with an expiry date on it. See below.
 
-The drive stages one fault per subsystem now, so all four owners in `OWNER`
-get exercised rather than two. The planner asks for lane 2.6 of a two lane
-road and holds it long enough to leave the roadway, which is `off_road`.
-Something is already in the space it steered into, so the excursion produces a
-near miss inside `MIN_CLEARANCE`, which is `collision` and belongs to
-prediction. Then the perception checkpoint runs the light, and the controller
-clips the curb while parking. They overlap on purpose:
+The drive stages one fault per subsystem, so all four owners in `OWNER` get
+exercised rather than two. The planner asks for lane 2.6 of a two lane road
+and holds it long enough to leave the roadway, which is `off_road`. A van is
+already parked in the space it steered into, so the excursion produces a near
+miss inside `MIN_CLEARANCE`, which is `collision` and belongs to prediction.
+Then the perception checkpoint runs the light, and the controller clips the
+curb while parking. They overlap on purpose:
 
 ```
 seq 108  ['collision', 'off_road']
 seq 109  ['collision', 'off_road']
-seq 110  ['collision', 'red_light_run', 'off_road']
+seq 110  ['red_light_run', 'off_road']
 ```
 
-`detect` used to return on its first match, so seq 110 would have been a
-`collision` and nothing else. The red light run would have been erased rather
-than deprioritised, because `stop_line_crossed` is true for exactly one tick
-and there is no later frame to catch it on, and blame would have been handed
-prediction instead of perception. Being wrong about which subsystem to blame
-is worse than reporting one incident fewer.
+`detect` used to return on its first match, so seq 108 would have been a
+`collision` and nothing else, and the off-road excursion still in progress
+under it would have been erased rather than deprioritised. Several things can
+be wrong at once, and a frame where two are wrong is not less interesting than
+one. The list is ordered most severe first, and the order is written down as a
+ranking rather than being whatever order the sensors happened to be tested in,
+because the loop hands downstream tooling the head of that list.
+
+The van, the parking bay and the curb are places, not times. They used to be
+time gates, which made the world a stage rig: the van "appeared" at 10.0 s
+whether or not the car was anywhere near it, so a drive that stopped for the
+amber still collided, on schedule, with a van 9 m ahead of where it stood.
+They are positions along the route now, and a car that stops short of them
+records no incident. That is what makes `replay` below mean something.
 
 Drives append to one history rather than each starting fresh, and every drive
 gets a `drive-NNNN` tag when it ends. That gives `git bisect` sensible places
@@ -236,13 +256,24 @@ to land, because you want to find the first bad drive, not some arbitrary frame
 in the middle of one. `carctl bisect` writes the script out and stops there:
 
 ```
-9 tagged drives, drive-0001 .. drive-0010
+6 tagged drives, drive-0001 .. drive-0006
 
-git -C /home/you/not-dying-in-traffic bisect start drive-0010 drive-0001
-git -C /home/you/not-dying-in-traffic bisect run carctl replay --assert-no-incident
+git -C C:/Users/fixed/not-dying-in-traffic bisect start drive-0006 drive-0001
+git -C C:/Users/fixed/not-dying-in-traffic bisect run carctl replay --assert-no-incident
 
 emitted, not run. bisecting a moving vehicle is not a thing.
 ```
+
+`carctl replay` is what makes the script actually runnable. At each bisect
+step git leaves one frame's files in the working tree; replay reads that
+frame's `seq` and its `models.json`, re-drives the deterministic plant with
+that checkpoint set pinned for the whole run -- no OTA swap -- and exits
+nonzero if the record up to that frame contains an incident. Pinning is the
+point: incidents in this world are caused by which checkpoint is in force, so
+frames committed under the good perception model replay clean end to end,
+frames committed under the bad one do not, and bisect converges on the first
+frame whose record shows the regression. `--kind red_light_run` narrows the
+assert to one incident kind if you want the perception story alone.
 
 The path and both revisions go through `shlex.quote` on the way out. They did
 not, which is a silly thing to get wrong in a script whose entire purpose is to
@@ -261,7 +292,7 @@ Popping is a three way merge between stashed intent, saved base and current
 world, and it is allowed to fail:
 
 ```
-git stash push -> refs/parking/421184df  (seq 124, return pose 40.2,84.1)
+git stash push -> refs/parking/a5603421  (seq 124, return pose 45.7,83.2)
   betting on: gap 6.1 m, clearance 0.55 m
 
 git stash pop  -> CONFLICT
@@ -290,7 +321,11 @@ plausible looking guess.
 The conflict check also reads all four facts it stores. It skipped
 `lead_vehicle_x` entirely, so the car in front could roll back into the gap and
 conflict with nothing, and the demo in `cli.py` copies that field forward
-unchanged, which is why nothing ever noticed.
+unchanged, which is why nothing ever noticed. The clearance rule is relative
+as well as floored now: the old absolute-tolerance version fired on gaps that
+were always tight and stayed that way, and stayed silent on a clearance that
+halved -- the exact event its comment claimed to catch -- because a halving of
+a tight gap is smaller than an absolute tolerance sized for a roomy one.
 
 ## The red button
 
@@ -308,17 +343,26 @@ unchecked. `GET /` handed the real token to any `Host` that asked for it, and
 `/events` streamed the live 10 Hz feed to the same. The line I had commented as
 blocking DNS rebinding was not on the requests that get rebound, which is the
 kind of thing you only notice by asking what actually calls it. Reads are
-checked now, and the route match ignores the query string and case, because
-`/?v=2` used to miss the token substitution and fall through to the static file
-handler, which served the page with the placeholder still in it: a dashboard
-that streams, looks completely healthy, and refuses every halt you press. The
-static handler is gone as well, since it also served `server.py` verbatim to
-anyone who asked.
+checked now -- and the check runs before the route match, so an unauthorised
+POST cannot even probe which routes exist. The route match ignores the query
+string and case, because `/?v=2` used to miss the token substitution and fall
+through to the static file handler, which served the page with the placeholder
+still in it: a dashboard that streams, looks completely healthy, and refuses
+every halt you press. The static handler is gone as well, since it also served
+`server.py` verbatim to anyone who asked.
 
 The page checks whether the halt was accepted. It did not, and a refusal is
 valid JSON, so a 403 rendered as a completed halt: HALTED banner, red button
 disabled, speed still updating underneath it. On the one control whose entire
 job is stopping a car, a refusal and a success must not look the same.
+
+The same standard applies to a page that arrives late. A browser that
+connected while the vehicle was halted used to fire `onopen`, print
+"streaming @ 10 Hz" over readouts showing `-`, and leave the halt button
+armed: stale state dressed as live, on a safety display. Every new subscriber
+gets a snapshot frame before the live events now, a reconnect cannot paint
+"streaming" over a HALTED banner, and the token-bearing page goes out with
+`Cache-Control: no-store`.
 
 One thing that bit me while testing the guard: `allow_reuse_address` means
 something different on Windows. A second process can bind a port another is
@@ -346,7 +390,10 @@ minimal-risk manoeuvre and stop where it is.
 ```
 
 That second number is always 0 m. I think showing it is the most useful thing
-on the whole dashboard.
+on the whole dashboard. The numbers in the dialog are a prediction made at the
+moment you clicked, and the stream keeps moving while you decide; the
+confirmation that follows shows the seq the record actually froze at, which is
+the server's answer rather than the page's guess.
 
 ## Publishing
 
@@ -382,18 +429,18 @@ dispatches by filename, and a filename with no scrubber stops the build instead
 of being published on the grounds that nobody thought about it.
 
 ```
-main    state.json    "x": 41.846469430637235, "y": 89.7491853669169
-        sensors.json  "light_distance": -20.134457378403937
-        message       Pose: 41.846469,89.749185 @ 0.9498 rad
+main    state.json    "x": 45.99462893454763, "y": 86.06200615370916
+        sensors.json  "light_distance": -17.048849869313287
+        message       Pose: 45.994629,86.062006 @ 1.3461 rad
         committer     a real personal address
 
-public  state.json    "x": 50.0, "y": 100.0
+public  state.json    "x": 50.0, "y": 75.0
         sensors.json  "light_distance": -25.0
-        message       Pose: 50.00,100.00 @ 0.9 rad
+        message       Pose: 50.00,75.00 @ 1.3 rad
         committer     fleet@not-dying-in-traffic.invalid
 ```
 
-The trailer carries six decimals on `main` now rather than two. The message and
+The trailer carries six decimals on `main` rather than two. The message and
 the blob are scrubbed independently, so a 2 dp trailer could snap into a
 different 25 m cell than the full precision pose did, and publishing two
 different cells for one frame narrows the true coordinate far more than either
@@ -421,9 +468,16 @@ not exist got you "nothing wrong". It raises now. A gate that answers the same
 way when it passes and when it never ran is worse than no gate, because only
 one of those two readings is true and you cannot tell which one you got.
 
-The push refspec is pinned in `.git/config` to
-`refs/heads/public:refs/heads/main`, and `push.default` is `nothing`, so a bare
-`git push` cannot reach `main` by accident.
+`lineage` is pushed alongside `public`. It is publishable by construction: it
+was designed to carry no pose precisely so it could be kept forever, and a
+clone without it answers every blame from the provisional `main` path.
+Shipping the scrubbed frames while withholding the one ref that explains them
+would publish the puzzle and keep the answer.
+
+The push refspecs are pinned in `.git/config` to
+`refs/heads/public:refs/heads/main` and `refs/heads/lineage:refs/heads/lineage`,
+and `push.default` is `nothing`, so a bare `git push` cannot reach `main` by
+accident.
 
 Nothing has been pushed yet. The repo is private, which lowers the stakes but
 does not change the design. Publishing stays a thing you type on purpose:
@@ -434,9 +488,9 @@ python -m carctl publish --push
 
 ## Retention, and the ref that outlives the frames
 
-At 10 Hz the car commits 864,000 times a day. Across the 1210 commits on
-`main` a frame costs 238.8 bytes packed, so a drive-day is about 197 MB and a
-year about 70 GB. Treat that as a floor: these are short scripted drives whose
+At 10 Hz the car commits 864,000 times a day. Across the 1020 commits on
+`main` a frame costs 255.1 bytes packed, so a drive-day is about 220 MB and a
+year about 80 GB. Treat that as a floor: these are short scripted drives whose
 poses delta extremely well, and it is measured after a repack.
 
 The number that decides the window is not a disk number. Blame has to reach
@@ -445,12 +499,12 @@ is `ckpt-controller-2026.03.01-0b12`, about six months old. Prune below that
 and `git blame -L n,n models.json` walks off the end of what survives and
 lands on the oldest remaining commit: a confident wrong answer, which is worse
 than no answer and is precisely the failure blame exists to prevent.
-Eighteen months of full frames to satisfy that would be about 105 GB.
+Eighteen months of full frames to satisfy that would be about 121 GB.
 
 So retention splits by file rather than by time.
 
 ```
-refs/heads/main      full frames, 14 days       ~2.8 GB at the floor,
+refs/heads/main      full frames, 14 days       ~3.1 GB at the floor,
                                                 budget 10 GB for real ratios
 refs/heads/lineage   models.json, forever       one commit per promotion
 ```
@@ -461,14 +515,14 @@ one. The lineage ref has to stand alone, because the frame the promotion
 happened on will be gone:
 
 ```
-16e1671  2026-08-30 07:17  promote perception to ckpt-perception-2026.07.14-a91f
+8044891  2026-08-31 01:42  promote perception to ckpt-perception-2026.07.14-a91f
             perception ckpt-perception-2026.05.30-1e4d -> ckpt-perception-2026.07.14-a91f
-            during drive-0010
+            during drive-0006
 ```
 
 The drive is a name in the body, not a ref. Retention deletes the tag along
-with the frames it bounds, so "during drive-0011" has to stay readable after
-`drive-0011` does not exist. That is what forced the tag name to be decided at
+with the frames it bounds, so "during drive-0006" has to stay readable after
+`drive-0006` does not exist. That is what forced the tag name to be decided at
 the start of a drive rather than at the end: the lineage commits are written
 mid-drive, and a tag cannot point at a tip that does not exist yet. It carries
 no pose either. This is the one ref kept forever, and `main` is pruned partly
@@ -489,21 +543,29 @@ changes every surviving commit's sha, and a sha is a frame's identity here:
 `refs/reverts/<sha>` is what anchors an incident to the frame it happened on,
 so a daily rewrite would invalidate yesterday's incident report. A graft
 reclaims nothing, because git disables replace refs while packing on purpose,
-and commit objects are 70% of the pack.
+and commit objects are over half the pack.
 
 ```
 carctl maintain --days 0
 
-stationary check: stopped, last frame reports 0.1 km/h
-cut at 7de1ae5288 (0 frame(s) inside the 0 day window; held back to the
+stationary check: stopped, last frame reports 0.4 km/h
+window: 0 day(s) (--days)
+cut at 75212b6012 (0 frame(s) inside the 0 day window; held back to the
                    start of the most recent drive)
-dropping 1210 of 1390 frame(s)
-dropping 8 ref(s) that reach below the cut
-expiring the reflogs of HEAD, refs/heads/main
-pack 1.6 MB -> 0.2 MB
+dropping 170 of 340 frame(s)
+dropping 3 ref(s) that reach below the cut
+rebuilt refs/heads/public from the pruned main
+expiring the reflogs of HEAD, refs/heads/main, refs/heads/public
+pack 0.4 MB -> 0.3 MB
 commit-graph dropped, not rebuilt: git does not write one for a shallow repository
 multi-pack-index rewritten
 ```
+
+The `window:` line names where the number came from -- the flag, the
+`CARCTL_WINDOW_DAYS` environment variable, or the default -- because the
+window decides which frames stop existing, and ambient configuration that can
+shorten it has to be visible in the report it shortened. A garbled value in
+the environment is refused loudly rather than silently falling back to 14.
 
 The refs go because a ref is what keeps objects alive, and a leftover revert
 anchor holds a whole chain of frames behind a commit that is on no branch at
@@ -519,6 +581,14 @@ lineage entry dated at or before the frames that ran under it. That is the
 same lookup blame does, run ahead of time. `carctl lineage --backfill` seeds
 the ref from the promotions already on `main`, which is what makes the gate
 satisfiable on a repo that predates it.
+
+A prune that fails after it has started changing the repository says so. The
+deleted refs and the shallow boundary land before the reflog expiry and the
+repack, and any of those later steps can fail -- a pack held open by a virus
+scanner is the usual Windows way. The report that failure interrupts survives
+it, marked as a prune that failed partway with the refs already gone, because
+"not pruned" and "half pruned" need opposite responses and the operator only
+gets to pick the right one if the report can tell them apart.
 
 The last line of that output is the price. Git will not write a commit-graph
 for a shallow repository, so once `main` has been pruned there is no
@@ -538,8 +608,9 @@ a lock file a drive writes for its own declared length, and the speed in the
 last committed frame.
 
 ```
-stationary check: the last frame on main reports 8.9 km/h; the vehicle is
+stationary check: the last frame on main reports 25.6 km/h; the vehicle is
                   moving, or the record is stale
+window: 14 day(s) (MAIN_WINDOW_DAYS default)
 refusing to touch the object store while the vehicle is not stopped
 ```
 
@@ -563,10 +634,9 @@ branch exists to take the Windows behaviour away, not to add anything
 elsewhere. Nothing else in the tree touches a platform API, no path is built
 by hand, no source path differs only by case, and every text-mode subprocess
 call names `encoding="utf-8"` explicitly, so a `LANG=C` shell cannot mangle
-the street names. The suite runs from a directory whose name contains spaces.
-The one version floor is `git` 2.32 for `repack --geometric`; older git takes
-the full repack instead and says so. What I have not done is execute it on
-Linux.
+the street names. The one version floor is `git` 2.32 for
+`repack --geometric`; older git takes the full repack instead and says so.
+What I have not done is execute it on Linux.
 
 A fresh clone lands on `main`, which is drive data and contains no source. The
 code is on `src`:
@@ -577,39 +647,49 @@ cd not-dying-in-traffic
 git checkout src
 ```
 
-Then, from the repo root. Use `python` rather than `python3` on Windows:
+Then, from the repo root. On Linux, substitute `python3` if that is what your
+distribution calls it:
 
 ```bash
-python3 -m carctl drive --seconds 14
+python -m carctl drive
+```
+
+The default drive is 17 s: long enough to run the whole script and come to
+rest, which matters because `maintain` reads the last committed frame's speed
+and refuses to touch the disk under a car that is still rolling. A drive cut
+short ends moving, and maintenance then waits for one that did not.
+
+```bash
+python -m carctl incident --kind red_light_run
 ```
 
 ```bash
-python3 -m carctl incident --kind red_light_run
+python -m carctl park
 ```
 
 ```bash
-python3 -m carctl park
+python -m carctl bisect
 ```
 
 ```bash
-python3 -m carctl bisect
+python -m carctl lineage
 ```
 
 ```bash
-python3 -m carctl lineage
+python -m carctl maintain --dry-run
 ```
 
 ```bash
-python3 -m carctl maintain --dry-run
+python -m carctl publish
 ```
 
 ```bash
-python3 -m carctl publish
+python dashboard/server.py
 ```
 
-```bash
-python3 dashboard/server.py
-```
+`pip install .` is optional and adds a `carctl` entry point on `PATH`, which
+is what the emitted bisect script calls; `python -m carctl` is the same thing
+without the install.
 
 `drive` writes commits to `refs/heads/main` and `refs/heads/lineage` in
 whatever repo you run it from, and `incident` writes a revert under
@@ -617,24 +697,34 @@ whatever repo you run it from, and `incident` writes a revert under
 `refs/heads/public` locally and stops there; it needs `--push` to reach the
 network, and the audit gate runs first either way.
 
-`maintain` deletes frames, so start with `--dry-run`. On a repo whose history
-predates the lineage ref it will refuse to prune until you have run
+`maintain` deletes frames, so start with `--dry-run`. A fresh drive writes its
+own lineage entries, so a repo born under this code is always prunable; a repo
+whose history predates the lineage ref will refuse to prune until you have run
 `carctl lineage --backfill`, which is the right order: the promotions on
-`main` are the evidence, and they have to be somewhere else before `main` goes.
+`main` are the evidence, and they have to be somewhere else before `main`
+goes.
 
-## Numbers from a real 14 s drive
+## Numbers from a real 17 s drive
 
 ```
-ticks             140
-committed         140
-dropped frames      0
-promotions          2   <- commits on refs/heads/lineage
-deadline overruns   0
-max jitter       0.61 ms
-max submit cost  26.3 us   <- the loop's entire git bill
-tagged as        drive-0010
-incidents           4  (off_road @ 102, collision @ 108,
-                        red_light_run @ 110, curb_strike @ 131)
+ticks           170
+committed       170
+dropped frames  0
+promotions      2   <- commits on refs/heads/lineage
+deadline overruns 0
+max jitter      0.64 ms
+max submit cost 24.5 us   <- the loop's entire git bill
+tagged as      drive-0006
+
+incidents: 5 across 4 kind(s)
+  off_road        first at seq  102  lateral offset -1.79 m from Ječná:2.6
+                  owner: planner
+  collision       first at seq  108  clearance=1.43 m
+                  owner: prediction
+  red_light_run   first at seq  110  crossed stop line at 43 km/h while perception reported 'green'
+                  owner: perception
+  curb_strike     first at seq  131  az=50.8 m/s^2
+                  owner: controller
 ```
 
 That overrun count used to read 1, on every drive I ever ran, sitting directly
@@ -652,9 +742,12 @@ low, since 0.1 is not representable, so every scripted event in the scenario
 was firing one tick late: the OTA swap at 61 rather than 60, the light at 103
 rather than 102.
 
-Two promotions on a fresh repo, not one: the first lineage commit records the
-checkpoint set the drive started with, because the ref had nothing in it to
-compare against. On a repo that has driven before, only the OTA swap is new.
+Two promotions in this drive, and neither is a human decision. The drive
+starts on the checkpoint set the source ships, which differs from what the
+lineage ref last saw -- the previous drive ended under the OTA swap -- so the
+first frame records a rollback. Then the swap lands again at 6.0 s. On a fresh
+repo the first commit records the whole starting set instead, because the ref
+has nothing to compare against.
 
 At 10 Hz the car commits 864,000 times a day. That is what the retention and
 repack policy above is for.
@@ -694,12 +787,14 @@ firm: it must outlive the oldest deployed checkpoint, and today that is six
 months. The full-frame half is a forensics question, how long after an
 incident anyone might still want 10 Hz poses on the vehicle rather than in
 whatever they were uploaded to, and I picked a number rather than leave it
-blank. `MAIN_WINDOW_DAYS` in `retain.py` is the one place to change it, and
-`carctl maintain --days N` overrides it for a single pass. If the answer is
-"we upload within a day and never read on-vehicle frames again", 3 days is
-plenty and the budget drops with it. Shortening it is safe in a way it would
-not have been before, because the thing that needed a long window no longer
-lives on `main`.
+blank. `MAIN_WINDOW_DAYS` in `retain.py` is the one place it lives,
+`CARCTL_WINDOW_DAYS` in the environment overrides it per deployment, and
+`carctl maintain --days N` overrides both for a single pass; every pass
+reports which of the three it used. If the answer is "we upload within a day
+and never read on-vehicle frames again", 3 days is plenty -- about 660 MB at
+the floor, call it 2 GB with the same margin -- and shortening it is safe in a
+way it would not have been before, because the thing that needed a long window
+no longer lives on `main`.
 
 Retention governs `refs/heads/main` and whatever reaches into it. A ref
 holding an independent copy of the record, a backup of an earlier `public`

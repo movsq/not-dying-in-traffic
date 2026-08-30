@@ -1,17 +1,17 @@
 """Retention and repack: what stops being kept, and when we may spend disk.
 
-At 10 Hz the car commits 864,000 times a day. Across the 1210 commits already
-on main a frame costs 238.8 bytes packed, so a drive-day is about 197 MB and a
-year about 70 GB. Treat that as a floor: these are short scripted drives whose
+At 10 Hz the car commits 864,000 times a day. Across the 1020 commits already
+on main a frame costs 255.1 bytes packed, so a drive-day is about 220 MB and a
+year about 80 GB. Treat that as a floor: these are short scripted drives whose
 poses delta extremely well, and it is measured after a repack.
 
 Blame has to reach back to the promotion of the oldest checkpoint still in
 service, which today is ckpt-controller-2026.03.01-0b12, about six months old.
-Eighteen months of full frames to satisfy that would be ~105 GB, so retention
+Eighteen months of full frames to satisfy that would be ~121 GB, so retention
 splits by file rather than by time:
 
   * Full frames on main: 14 days. Enough for incident forensics plus upload
-    lag, ~2.8 GB at the floor, budget 10 GB for real delta ratios.
+    lag, ~3.1 GB at the floor, budget 10 GB for real delta ratios.
   * models.json: kept indefinitely on refs/heads/lineage, which commits that
     one file, one commit per promotion. See lineage.py.
 
@@ -28,7 +28,7 @@ here: refs/reverts/<sha> is what anchors an incident to the frame it happened
 on, and every incident report ever printed names one. Rewriting main daily
 would invalidate yesterday's incident report. A graft was the other candidate
 and does not work: git disables replace refs while packing, on purpose, so the
-commit objects survive, and commits are 70% of the pack.
+commit objects survive, and commits are over half the pack.
 
 The price is the commit-graph. Git declines to write one in a shallow
 repository, because the parent of the boundary commit is not there to record,
