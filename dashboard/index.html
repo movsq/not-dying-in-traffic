@@ -1,0 +1,152 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>not-dying-in-traffic</title>
+<style>
+  :root{--bg:#0b0d10;--panel:#14181d;--line:#232a32;--fg:#e6edf3;--dim:#8b98a5;
+        --ok:#3fb950;--warn:#d29922;--bad:#f85149;--mono:ui-monospace,"Cascadia Mono",Consolas,monospace}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 var(--mono)}
+  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px;
+         border-bottom:1px solid var(--line)}
+  header b{font-size:15px}header span{color:var(--dim);font-size:12px}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px;max-width:1100px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}
+  h2{margin:0 0 12px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);font-weight:600}
+  .speed{font-size:56px;line-height:1;font-variant-numeric:tabular-nums}
+  .speed small{font-size:14px;color:var(--dim)}
+  dl{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:0}
+  dt{color:var(--dim)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+  .commit{border-left:2px solid var(--ok);padding-left:10px;word-break:break-word}
+  .commit.irrev{border-color:var(--bad)}
+  .pill{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;border:1px solid}
+  .pill.ok{color:var(--ok);border-color:var(--ok)}
+  .pill.bad{color:var(--bad);border-color:var(--bad)}
+  .incident{margin-top:12px;padding:10px;border:1px solid var(--bad);
+            border-radius:6px;color:var(--bad);background:#f8514912}
+  .full{grid-column:1/-1}
+  button.danger{width:100%;padding:20px;font:600 17px var(--mono);color:#fff;
+    background:#b62324;border:1px solid #f85149;border-radius:8px;cursor:pointer;
+    letter-spacing:.02em}
+  button.danger:hover{background:#d13b3c}
+  button.danger:disabled{opacity:.45;cursor:not-allowed}
+  .hint{color:var(--dim);font-size:12px;margin-top:10px}
+  dialog{background:var(--panel);color:var(--fg);border:1px solid var(--bad);
+         border-radius:10px;padding:22px;max-width:430px;font:14px/1.55 var(--mono)}
+  dialog::backdrop{background:#000b}
+  dialog h3{margin:0 0 10px;color:var(--bad);font-size:15px}
+  dialog .row{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
+  dialog button{padding:8px 14px;border-radius:6px;font:13px var(--mono);cursor:pointer}
+  dialog .go{background:#b62324;color:#fff;border:1px solid #f85149}
+  dialog .no{background:transparent;color:var(--fg);border:1px solid var(--line)}
+</style>
+
+<header>
+  <b>not-dying-in-traffic</b>
+  <span id="conn">connecting…</span>
+  <span id="seq"></span>
+</header>
+
+<main>
+  <section>
+    <h2>Vehicle</h2>
+    <div class="speed"><span id="kmh">–</span><small> km/h</small></div>
+    <dl style="margin-top:14px">
+      <dt>road</dt><dd id="road">–</dd>
+      <dt>manoeuvre</dt><dd id="man">–</dd>
+      <dt>pose</dt><dd id="pose">–</dd>
+      <dt>steer</dt><dd id="steer">–</dd>
+      <dt>signal</dt><dd id="light">–</dd>
+      <dt>clearance</dt><dd id="clr">–</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>HEAD</h2>
+    <div class="commit" id="commit">–</div>
+    <dl style="margin-top:14px">
+      <dt>reversible</dt><dd id="rev">–</dd>
+      <dt>last good seq</dt><dd id="lastgood">–</dd>
+      <dt>perception</dt><dd id="ckpt">–</dd>
+    </dl>
+    <div class="incident" id="inc" hidden></div>
+  </section>
+
+  <section class="full">
+    <h2>Rollback</h2>
+    <button class="danger" id="btn">git revert --hard</button>
+    <div class="hint" id="hint">
+      Reverts the record to the last commit marked reversible and brings the
+      vehicle to a controlled stop. Frames already committed to the world are
+      not among them.
+    </div>
+  </section>
+</main>
+
+<dialog id="dlg">
+  <h3>are you sure? this cannot be undone (physically)</h3>
+  <div id="dlgbody"></div>
+  <div class="row">
+    <button class="no" id="no">cancel</button>
+    <button class="go" id="yes">revert --hard</button>
+  </div>
+</dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+let last = null;
+
+const es = new EventSource('/events');
+es.onopen = () => $('conn').textContent = 'streaming @ 10 Hz';
+es.onerror = () => $('conn').textContent = 'stream lost';
+es.onmessage = e => {
+  const d = JSON.parse(e.data);
+  if (d.halted) { halt(d.note); return; }
+  if (last && d.seq < last.seq) { $('inc').hidden = true; }  // new drive, clear stale incident
+  last = d;
+  $('seq').textContent  = 'seq ' + d.seq;
+  $('kmh').textContent  = d.kmh.toFixed(1);
+  $('road').textContent = d.road;
+  $('man').textContent  = d.maneuver;
+  $('pose').textContent = d.x + ', ' + d.y;
+  $('steer').textContent = d.steer.toFixed(3) + ' rad';
+  $('light').textContent = d.light;
+  $('clr').textContent  = d.clearance + ' m';
+  $('commit').textContent = d.subject;
+  $('commit').classList.toggle('irrev', !d.reversible);
+  $('rev').innerHTML = d.reversible
+    ? '<span class="pill ok">yes</span>'
+    : '<span class="pill bad">no</span>';
+  $('lastgood').textContent = d.last_good_seq;
+  $('ckpt').textContent = (d.checkpoints.perception || '').replace('ckpt-perception-','');
+  if (d.incident) {
+    $('inc').hidden = false;
+    $('inc').textContent = d.incident.kind + ' — ' + d.incident.detail +
+                           '  [owner: ' + d.incident.owner + ']';
+  }
+};
+
+// The dialog is not decoration. It is the last place a human sees the two
+// numbers that differ: what the record will roll back, and what the world will.
+$('btn').onclick = () => {
+  const behind = last ? (last.seq - last.last_good_seq) : 0;
+  $('dlgbody').innerHTML =
+    '<p>Record plane: rolls back <b>' + behind + '</b> frame(s) to seq ' +
+    (last ? last.last_good_seq : '?') + '.</p>' +
+    '<p>Physical plane: rolls back <b>0 m</b>. The vehicle will run a ' +
+    'minimal-risk manoeuvre and stop where it is.</p>';
+  $('dlg').showModal();
+};
+$('no').onclick  = () => $('dlg').close();
+$('yes').onclick = async () => {
+  $('dlg').close();
+  const r = await fetch('/revert-hard', {method:'POST'});
+  halt(JSON.stringify(await r.json()));
+};
+
+function halt(note) {
+  $('conn').textContent = 'HALTED';
+  $('btn').disabled = true;
+  $('btn').textContent = 'reverted — record frozen';
+  $('hint').textContent = note;
+}
+</script>

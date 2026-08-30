@@ -1,0 +1,19 @@
+{
+  "ckpt-perception-2026.05.30-1e4d": {
+    "trained": "2026-05-30",
+    "dataset": "eu-urban-v11",
+    "shadow_km": 412000,
+    "status": "retired 2026-07-14",
+    "notes": "baseline traffic-light head"
+  },
+  "ckpt-perception-2026.07.14-a91f": {
+    "trained": "2026-07-14",
+    "dataset": "eu-urban-v12+synthetic-lowsun",
+    "shadow_km": 9100,
+    "status": "promoted by OTA agent, shadow coverage below the 250000 km gate",
+    "notes": "amber/green confusion at solar elevation < 8 deg, west-facing"
+  },
+  "ckpt-controller-2026.03.01-0b12": {"trained": "2026-03-01", "status": "stable"},
+  "ckpt-planner-2026.08.19-3de0": {"trained": "2026-08-19", "status": "stable"},
+  "ckpt-prediction-2026.06.02-77c1": {"trained": "2026-06-02", "status": "stable"}
+}
