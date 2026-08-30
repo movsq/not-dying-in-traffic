@@ -1,0 +1,6 @@
+{
+  "controller": "ckpt-controller-2026.03.01-0b12",
+  "perception": "ckpt-perception-2026.05.30-1e4d",
+  "planner": "ckpt-planner-2026.08.19-3de0",
+  "prediction": "ckpt-prediction-2026.06.02-77c1"
+}
