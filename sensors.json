@@ -3,7 +3,7 @@
  "lane_ref": "Je\u010dn\u00e1:1",
  "lateral_offset": -0.9,
  "lidar_min_bearing": -0.4,
- "lidar_min_range": 12.2,
+ "lidar_min_range": 11.3,
  "lidar_min_range_rear": 40.0,
  "light_distance": 0.0,
  "light_state": "red",
