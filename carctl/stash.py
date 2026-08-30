@@ -31,10 +31,22 @@ class Preconditions:
         c = []
         if other.gap_length_m < self.gap_length_m - 0.4:
             c.append(f"gap shrank {self.gap_length_m:.2f}m -> {other.gap_length_m:.2f}m")
+        # The car in front was stored at push time and then never consulted,
+        # so a lead vehicle that rolled back into the gap conflicted with
+        # nothing: gap length and vehicle positions come from different
+        # estimators, so an unchanged gap_length_m is not evidence about it.
+        if abs(other.lead_vehicle_x - self.lead_vehicle_x) > 0.5:
+            c.append("vehicle in front moved")
         if abs(other.follow_vehicle_x - self.follow_vehicle_x) > 0.5:
             c.append("vehicle behind moved")
-        if other.clearance_m < 0.3:
+        # Relative, not absolute. The absolute floor fired on gaps that were
+        # always tight and stayed that way, and stayed silent on a clearance
+        # that halved while remaining above it.
+        if other.clearance_m < min(0.3, self.clearance_m - 0.15):
             c.append(f"clearance {other.clearance_m:.2f}m below margin")
+        elif other.clearance_m < self.clearance_m - 0.15:
+            c.append(f"clearance shrank {self.clearance_m:.2f}m -> "
+                     f"{other.clearance_m:.2f}m")
         return c
 
 
