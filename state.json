@@ -2,13 +2,13 @@
  "maneuver": "park",
  "pose": {
   "heading": 1.5,
-  "steer": -0.2,
-  "v": 5.3,
+  "steer": -0.3,
+  "v": 4.9,
   "x": 50.0,
   "y": 75.0
  },
  "reversible": true,
  "road": "Je\u010dn\u00e1",
- "seq": 126,
+ "seq": 127,
  "t_mono_ns": 0
 }
