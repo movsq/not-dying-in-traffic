@@ -50,6 +50,15 @@ class Frame:
     reversible: bool      # can the physical world be walked back from here?
     checkpoints: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self):
+        # frozen=True stops rebinding, not mutation, and this dict arrives by
+        # reference from the plant. The committer thread can read it up to
+        # QUEUE_DEPTH * DT = 51 s after capture, so an in-place edit would
+        # retroactively rewrite frames already queued and attribute pre-swap
+        # frames to the post-swap checkpoint, destroying the one piece of
+        # evidence models.json exists to carry. Copy at the boundary.
+        object.__setattr__(self, "checkpoints", dict(self.checkpoints))
+
     def state_json(self) -> str:
         return json.dumps(
             {"seq": self.seq, "t_mono_ns": self.t_mono_ns,
@@ -67,11 +76,14 @@ class Frame:
         # One subsystem per line, deliberately. `git blame -L n,n models.json`
         # then resolves to the commit that last swapped that checkpoint, which
         # is the whole point of the file existing.
+        # json.dumps per key and value, not f-string interpolation: a
+        # checkpoint id containing a quote or a backslash used to emit a file
+        # that is not JSON, which every reader downstream of blame parses.
         lines = ["{"]
         items = sorted(self.checkpoints.items())
         for i, (k, v) in enumerate(items):
             comma = "," if i < len(items) - 1 else ""
-            lines.append(f'  "{k}": "{v}"{comma}')
+            lines.append(f'  {json.dumps(k)}: {json.dumps(v)}{comma}')
         lines.append("}")
         return "\n".join(lines) + "\n"
 
