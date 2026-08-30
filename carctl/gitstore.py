@@ -20,7 +20,7 @@ Two consequences worth knowing about:
     reported; a drop is a defect, not a normal condition.
 """
 from __future__ import annotations
-import queue, subprocess, tempfile, threading
+import queue, subprocess, tempfile, threading, time
 from .state import Frame
 from . import msgen
 
@@ -32,6 +32,19 @@ IDENT = b"not-dying-in-traffic <vsedlacek1337@gmail.com>"
 
 def _data(payload: bytes) -> bytes:
     return b"data %d\n" % len(payload) + payload
+
+
+def _tz_offset(epoch_s: int) -> bytes:
+    """This machine's real UTC offset at that instant.
+
+    fast-import's raw format takes `<epoch> <offset>`. The epoch was always
+    correct, but the offset was hardcoded to +0200, so every commit written
+    outside Prague summer time displayed an hour off its own timestamp.
+    """
+    off = -(time.altzone if time.localtime(epoch_s).tm_isdst else time.timezone)
+    sign = "+" if off >= 0 else "-"
+    off = abs(off)
+    return f"{sign}{off // 3600:02d}{off % 3600 // 60:02d}".encode()
 
 
 class Committer:
@@ -99,7 +112,8 @@ class Committer:
 
     def _emit(self, f: Frame) -> bytes:
         out = [b"commit " + self.ref + b"\n",
-               b"committer " + IDENT + b" %d +0200\n" % f.t_wall_s,
+               b"committer " + IDENT + b" %d " % f.t_wall_s
+               + _tz_offset(f.t_wall_s) + b"\n",
                _data(msgen.message(f).encode())]
         if self._need_from:
             out.append(b"from " + self.ref + b"^0\n")
