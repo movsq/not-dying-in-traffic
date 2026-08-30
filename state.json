@@ -1,14 +1,14 @@
 {
  "maneuver": "cruise",
  "pose": {
-  "heading": 1.6,
-  "steer": 0.2,
+  "heading": 1.7,
+  "steer": 0.1,
   "v": 12.0,
   "x": 50.0,
   "y": 75.0
  },
  "reversible": false,
  "road": "Je\u010dn\u00e1",
- "seq": 108,
+ "seq": 109,
  "t_mono_ns": 0
 }
