@@ -1,14 +1,14 @@
 {
  "maneuver": "turn_left",
  "pose": {
-  "heading": 0.2,
+  "heading": 0.3,
   "steer": 0.3,
-  "v": 7.6,
+  "v": 7.3,
   "x": 25.0,
   "y": 0.0
  },
  "reversible": true,
  "road": "Je\u010dn\u00e1",
- "seq": 28,
+ "seq": 29,
  "t_mono_ns": 0
 }
