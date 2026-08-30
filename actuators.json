@@ -1,5 +1,5 @@
 {
- "brake": 0.53,
- "steer_cmd": 0.38,
+ "brake": 0.48,
+ "steer_cmd": 0.4,
  "throttle": 0.0
 }
