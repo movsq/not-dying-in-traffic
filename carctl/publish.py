@@ -106,6 +106,8 @@ def scrub_sensors(raw: bytes) -> bytes:
     fingerprint. The lidar ranges carry the same trailing-digit fingerprint.
     """
     d = _load(raw, "sensors.json")
+    # lane_ref names a street and a lane, which state.json already publishes
+    # as `road`, so it passes through: it is a decision, not an omission.
     if "light_distance" in d:
         d["light_distance"] = _snap(d["light_distance"])
     for key, places in (("lateral_offset", 1), ("lidar_min_range", 1),

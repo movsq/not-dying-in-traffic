@@ -91,9 +91,18 @@ def detect(f: Frame, true_light: str) -> list[Incident]:
             "red_light_run", f.seq,
             f"crossed stop line at {f.pose.v * 3.6:.0f} km/h "
             f"while perception reported '{f.sensors.light_state}'"))
-    if abs(f.sensors.lateral_offset) > MAX_LAT_OFFSET:
+    # No reference path means lateral_offset is a placeholder, so there is
+    # nothing to compare against and a 0.0 must not be read as a held lane.
+    # The only manoeuvre without one is parking, which leaves the lane
+    # deliberately. This is a gap by construction, so it is recorded in every
+    # frame rather than inferred: lane_ref is committed in sensors.json, and
+    # an empty one is visible in the history as the reason off_road was not
+    # evaluated.
+    if (f.sensors.lane_ref
+            and abs(f.sensors.lateral_offset) > MAX_LAT_OFFSET):
         found.append(Incident("off_road", f.seq,
-                              f"lateral offset {f.sensors.lateral_offset:.2f} m"))
+                              f"lateral offset {f.sensors.lateral_offset:.2f} m "
+                              f"from {f.sensors.lane_ref}"))
     return found
 
 
