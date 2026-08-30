@@ -8,18 +8,42 @@ WHEELBASE = 2.7  # m
 DT = 0.1         # s, one tick, one commit
 DT_NS = 100_000_000   # the same tick as an exact integer of nanoseconds
 
-# The scripted drive. (t_start, road, maneuver, steer_cmd, target_speed)
+LANE_WIDTH = 3.2   # m
+N_LANES = 2        # per road, numbered rightward from 0
+
+# Each street is a straight centreline: a point on it and the heading of
+# travel. `lateral_offset` is the signed distance from the centre of the
+# nearest lane the car is allowed to be in, positive to the left. Before this
+# it was a decorative sine of amplitude 0.12 m against an off-road threshold
+# of 1.75 m, so `off_road` was one of four incident kinds that nothing could
+# trigger, and the planner was the one subsystem blame never got asked about.
+ROADS = {
+    "Vinohradská": ((0.0, 0.0), 0.0),
+    "Hlavní":      ((41.8, 0.0), math.pi / 2),
+}
+
+# The scripted drive.
+#   (t_start, road, maneuver, steer_cmd, target_speed, lane)
+# `lane` is the lane the planner is asking for, and the plant steers to hold
+# it. `None` hands steering back to steer_cmd for the manoeuvres a lane model
+# does not describe: a junction has no lane centreline, and parking leaves the
+# lane on purpose.
 SCRIPT = [
-    (0.0,  "Vinohradská", "cruise",      0.00, 13.9),
-    (1.5,  "Vinohradská", "brake",       0.00,  6.0),
-    (2.5,  "Hlavní"     , "turn_left",   0.30,  5.0),
-    (4.5,  "Hlavní",      "turn_left",   0.10,  6.0),
-    (5.5,  "Hlavní",      "cruise",      0.00, 12.0),
-    (7.0,  "Hlavní",      "cruise",      0.00, 13.5),
-    (9.0,  "Hlavní",      "lane_change", -0.06, 12.0),
-    (10.0, "Hlavní",      "cruise",      0.02, 12.0),
-    (11.5, "Hlavní",      "brake",       0.00,  2.0),
-    (12.5, "Hlavní",      "park",       -0.35,  1.5),
+    (0.0,  "Vinohradská", "cruise",      0.00, 13.9, 0),
+    (1.5,  "Vinohradská", "brake",       0.00,  6.0, 0),
+    (2.5,  "Hlavní"     , "turn_left",   0.30,  5.0, None),
+    (4.5,  "Hlavní",      "turn_left",   0.10,  6.0, None),
+    (5.5,  "Hlavní",      "cruise",      0.00, 12.0, 0),
+    (7.0,  "Hlavní",      "cruise",      0.00, 13.5, 0),
+    # The planner asks for lane 2.3 on a two lane road. This is the planner
+    # fault the drive exists to exercise, and it is the mirror of the
+    # perception one: a bad target, held long enough to leave the roadway,
+    # then corrected. `off_road` fires while the car is out there and
+    # OWNER maps it to the planner.
+    (9.0,  "Hlavní",  "lane_change_right", 0.00, 12.0, 2.6),
+    (10.6, "Hlavní",      "cruise",      0.00, 12.0, 1),
+    (11.5, "Hlavní",      "brake",       0.00,  2.0, 1),
+    (12.5, "Hlavní",      "park",       -0.35,  1.5, None),
 ]
 
 # The stop line the car is going to blow through, because the perception
@@ -38,6 +62,25 @@ CHECKPOINTS = {
 # event `git blame` has to find later.
 OTA_SWAP_AT = 6.0
 OTA_SWAP = ("perception", "ckpt-perception-2026.07.14-a91f")
+
+
+def lane_offset(road: str, x: float, y: float) -> float:
+    """Signed distance left of the road centreline, in metres."""
+    (px, py), th = ROADS[road]
+    return -(x - px) * math.sin(th) + (y - py) * math.cos(th)
+
+
+def nearest_lane_error(road: str, x: float, y: float) -> float:
+    """Signed distance from the centre of the nearest lane we may be in.
+
+    Lane k sits k * LANE_WIDTH to the right of the centreline, so at a left
+    offset of -k * LANE_WIDTH. Measuring against the nearest of them is what
+    makes the number mean "how far out of a lane are you" rather than "how far
+    from the middle of the road", which a car correctly in lane 1 is always a
+    full lane width from.
+    """
+    off = lane_offset(road, x, y)
+    return min((off + k * LANE_WIDTH for k in range(N_LANES)), key=abs)
 
 
 def _script_at(t: float):
@@ -69,6 +112,13 @@ class Plant:
                 return "green", dist
         return true_state, dist
 
+    def _lane_steer(self, road: str, lane: float) -> float:
+        """Steer to hold the lane the planner asked for."""
+        (_, th) = ROADS[road]
+        cross = -lane * LANE_WIDTH - lane_offset(road, self.pose.x, self.pose.y)
+        head = (th - self.pose.heading + math.pi) % (2 * math.pi) - math.pi
+        return max(-0.45, min(0.45, 0.05 * cross + 0.9 * head))
+
     def true_light(self) -> str:
         return "red" if self.t >= LIGHT_RED_AT else "green"
 
@@ -77,7 +127,7 @@ class Plant:
             self.checkpoints = dict(self.checkpoints)
             self.checkpoints[OTA_SWAP[0]] = OTA_SWAP[1]
 
-        t0, road, maneuver, steer_cmd, v_target = _script_at(self.t)
+        t0, road, maneuver, steer_cmd, v_target, lane = _script_at(self.t)
 
         # Longitudinal: crude P controller onto the scripted target speed.
         err = v_target - self.pose.v
@@ -85,8 +135,14 @@ class Plant:
         brake = max(0.0, min(1.0, -err / 6.0))
         a = 3.0 * throttle - 6.0 * brake
 
-        # Lateral: first-order steering actuator lag.
-        steer = self.pose.steer + (steer_cmd - self.pose.steer) * 0.35
+        # Lateral: hold the commanded lane where there is one, otherwise take
+        # the scripted steer. Open loop steering cannot hold a lane, and the
+        # old script did not try: it wandered 3.4 m of x across a street that
+        # is meant to be straight, which a lane model makes impossible to
+        # ignore.
+        cmd = steer_cmd if lane is None else self._lane_steer(road, lane)
+        # First-order steering actuator lag.
+        steer = self.pose.steer + (cmd - self.pose.steer) * 0.35
 
         v = max(0.0, self.pose.v + a * DT)
         heading = self.pose.heading + (v / WHEELBASE) * math.tan(steer) * DT
@@ -99,11 +155,25 @@ class Plant:
         # A parked van appears at 12.0 s; that is what the parking manoeuvre
         # is squeezing in behind.
         lidar = 40.0
+        # Something is already occupying the space the planner steered into.
+        # The excursion is what brings the car inside MIN_CLEARANCE of it, so
+        # the near miss is downstream of the planner fault and prediction owns
+        # it. Without this, `collision` is the incident kind nothing triggers:
+        # a successful parallel park used to stand in for one, which is the
+        # false positive PARK_CLEARANCE exists to stop.
+        if 10.0 <= self.t < 11.1:
+            lidar = max(1.2, 12.0 - (self.t - 10.0) * 14.0)
         if self.t >= 11.8:
             lidar = max(1.4, 14.0 - (self.t - 11.8) * 6.0)
         curb = 0.0
         if maneuver == "park" and self.t >= 13.1:
             curb = 41.0  # curb strike: irreversible, and the IMU says so
+
+        # Off the lane model there is nothing honest to report: a junction has
+        # no lane centreline in a straight-line model, and parking leaves the
+        # lane on purpose. Reporting the distance from the road we are turning
+        # onto would be a number about the wrong road.
+        lat = 0.0 if lane is None else nearest_lane_error(road, x, y)
 
         # The crossing is one tick, not every tick after it.
         crossed_now = self.prev_light_dist > 0 >= light_dist
@@ -120,7 +190,7 @@ class Plant:
             lidar_min_bearing=0.0 if lidar > 20 else -0.4,
             light_state=light_state,
             light_distance=light_dist,
-            lateral_offset=math.sin(self.t * 1.7) * 0.12,
+            lateral_offset=lat,
             wheel_slip=0.02 if brake < 0.5 else 0.11,
             imu_accel_z=9.81 + curb,
             lidar_min_range_rear=lidar_rear,
@@ -128,7 +198,7 @@ class Plant:
         )
         actuators = Actuators(throttle=round(throttle, 3),
                               brake=round(brake, 3),
-                              steer_cmd=round(steer_cmd, 3))
+                              steer_cmd=round(cmd, 3))
 
         # Reversibility is decided here, at capture time, not at revert time.
         # Anything that dissipated energy into the world is a one-way door.

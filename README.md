@@ -65,6 +65,15 @@ Four files. The shape of `models.json` matters more than it looks.
 
 `state.json` holds pose, speed, street, manoeuvre and a `reversible` flag.
 `sensors.json` holds lidar, signal state, lateral offset and IMU.
+`lateral_offset` is the signed distance from the centre of the nearest lane
+the car is allowed to be in, measured against a straight centreline per
+street. It used to be a decorative sine of amplitude 0.12 m against an
+off-road threshold of 1.75 m, which meant `off_road` was one of four incident
+kinds that nothing in the scenario could trigger, and the planner was the one
+subsystem `git blame` never got asked about. Making it real also meant the
+plant had to close the loop on it: open loop steering cannot hold a lane, and
+the old script wandered 3.4 m of `x` across a street that is meant to be
+straight.
 `actuators.json` holds what we actually commanded, which is often not what we
 meant. `models.json` holds one checkpoint per line, and that one formatting
 choice is what makes blame useful later.
@@ -167,6 +176,27 @@ Fifty commits and five seconds before the car ran the light, an OTA agent
 promoted a perception checkpoint with 3.6% of the shadow mileage its gate
 required. Blame found it starting from nothing but the incident commit. That
 is the one place where the git metaphor stops being a joke and earns its keep.
+
+The drive stages one fault per subsystem now, so all four owners in `OWNER`
+get exercised rather than two. The planner asks for lane 2.6 of a two lane
+road and holds it long enough to leave the roadway, which is `off_road`.
+Something is already in the space it steered into, so the excursion produces a
+near miss inside `MIN_CLEARANCE`, which is `collision` and belongs to
+prediction. Then the perception checkpoint runs the light, and the controller
+clips the curb while parking. They overlap on purpose:
+
+```
+seq 108  ['collision', 'off_road']
+seq 109  ['collision', 'off_road']
+seq 110  ['collision', 'red_light_run', 'off_road']
+```
+
+`detect` used to return on its first match, so seq 110 would have been a
+`collision` and nothing else. The red light run would have been erased rather
+than deprioritised, because `stop_line_crossed` is true for exactly one tick
+and there is no later frame to catch it on, and blame would have been handed
+prediction instead of perception. Being wrong about which subsystem to blame
+is worse than reporting one incident fewer.
 
 Drives append to one history rather than each starting fresh, and every drive
 gets a `drive-NNNN` tag when it ends. That gives `git bisect` sensible places
@@ -421,10 +451,11 @@ ticks             140
 committed         140
 dropped frames      0
 deadline overruns   0
-max jitter       0.55 ms
-max submit cost  27.0 us   <- the loop's entire git bill
-tagged as        drive-0010
-incidents           2  (red_light_run @ seq 110, curb_strike @ seq 131)
+max jitter       0.53 ms
+max submit cost  21.2 us   <- the loop's entire git bill
+tagged as        drive-0011
+incidents           4  (off_road @ 102, collision @ 108,
+                        red_light_run @ 110, curb_strike @ 131)
 ```
 
 That overrun count used to read 1, on every drive I ever ran, sitting directly
@@ -464,12 +495,11 @@ vehicle has, so the one claim I was confident about was the one the code did
 not support. It asks for an oracle now and falls back to what perception
 reported when there is not one, which is all a real vehicle knows at the time.
 
-`off_road` is one of the four incident kinds and the scripted drive cannot
-trigger it. `lateral_offset` in the plant is a decorative sine with an
-amplitude of 0.12 m against a threshold of 1.75 m, so the planner is the one
-subsystem `git blame` never gets asked about. Fixing that needs a lane model
-rather than a bigger number, which is why it is in this section rather than
-the previous one.
+The lane model is one straight centreline per street, so it says nothing
+inside a junction. The plant reports a lateral offset of 0.0 during a turn and
+during parking rather than measuring the car against the road it is only part
+way onto, which would be a number about the wrong street. A real one wants a
+path through the junction.
 
 fast-import only makes refs visible at a `checkpoint`, so `git log` trails live
 state by up to 50 frames. Drop `CHECKPOINT_EVERY` in `gitstore.py` if you want

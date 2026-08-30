@@ -13,7 +13,13 @@ _VERB = {
     "brake":       ("fix",   "slowed to {kmh:.0f} km/h on {road}"),
     "turn_left":   ("feat",  "turned left onto {road}"),
     "turn_right":  ("feat",  "turned right onto {road}"),
-    "lane_change": ("refactor", "moved to the {side} lane of {road}"),
+    # The classifier names the direction, because the frame cannot recover it.
+    # Deriving it from steer_cmd reads whatever the controller happens to be
+    # doing on that tick: mid-manoeuvre the lane keeper is already steering
+    # back the other way to settle, so a right hand lane change committed
+    # "moved to the left lane" on exactly the frames that mattered.
+    "lane_change_left":  ("refactor", "moved to the left lane of {road}"),
+    "lane_change_right": ("refactor", "moved to the right lane of {road}"),
     "park":        ("chore", "parallel parking on {road}"),
     "stop":        ("chore", "came to a stop on {road}"),
 }
@@ -21,13 +27,7 @@ _VERB = {
 
 def subject(f: Frame) -> str:
     kind, tmpl = _VERB.get(f.maneuver, ("chore", "held state on {road}"))
-    # Positive steer increases heading, and heading 0 is east, so positive is
-    # a left turn. The template said "left" unconditionally, so the scripted
-    # lane change (steer_cmd -0.06, heading 1.5892 -> 1.4614, a move to the
-    # right) committed the opposite of what the car did, into a history whose
-    # entire point is that people will grep it.
-    side = "left" if f.actuators.steer_cmd > 0 else "right"
-    body = tmpl.format(road=f.road, kmh=f.pose.v * 3.6, side=side)
+    body = tmpl.format(road=f.road, kmh=f.pose.v * 3.6)
     # `!` is the Conventional Commits breaking-change marker. Here it means
     # exactly that: this frame cannot be reverted, so it breaks the history's
     # otherwise-invertible property. Downstream tooling filters on it.
