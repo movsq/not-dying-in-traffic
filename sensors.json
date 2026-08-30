@@ -1,10 +1,10 @@
 {
- "imu_accel_z": 50.8,
+ "imu_accel_z": 9.8,
  "lane_ref": "",
  "lateral_offset": 0.0,
  "lidar_min_bearing": -0.4,
- "lidar_min_range": 2.9,
- "lidar_min_range_rear": 0.8,
+ "lidar_min_range": 2.7,
+ "lidar_min_range_rear": 40.0,
  "light_distance": -25.0,
  "light_state": "red",
  "stop_line_crossed": false,
