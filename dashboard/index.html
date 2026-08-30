@@ -98,18 +98,32 @@
 <script>
 const $ = id => document.getElementById(id);
 let last = null;
+// The connection label and the safety state are two different facts, and the
+// label is not allowed to overwrite the state. A reconnect used to paint
+// "streaming @ 10 Hz" over a HALTED banner while the server was still halted,
+// which is the display lying about the vehicle to the person holding the
+// button. Every payload sets this, the seed frame included.
+let halted = false;
 
 const es = new EventSource('/events');
-es.onopen = () => $('conn').textContent = 'streaming @ 10 Hz';
-es.onerror = () => $('conn').textContent = 'stream lost';
+es.onopen = () => $('conn').textContent =
+  halted ? 'HALTED' : 'streaming @ 10 Hz';
+es.onerror = () => $('conn').textContent =
+  halted ? 'HALTED — stream lost' : 'stream lost';
 es.onmessage = e => {
   const d = JSON.parse(e.data);
-  if (d.halted) { halt(d.note); return; }
+  if (d.halted) { halt(d.note || noteFor(d.record_frozen_at_seq)); return; }
   // Another tab pressed resume. With no branch here the payload fell through
   // to the frame renderer, d.kmh.toFixed threw, and this tab stayed locked in
   // the halted UI -- dead red button under a HALTED banner -- while the
   // vehicle was driving again and the readings below it kept updating.
   if (d.resumed) { unhalt(); return; }
+  // The server's seed frame, when nothing has been driven yet. It carries no
+  // telemetry, only the one fact the page cannot guess -- we are not halted.
+  // Render that and wait; falling through would throw on d.kmh.toFixed and
+  // leave the page frozen on its placeholders under a "streaming" label.
+  if (d.seq === undefined) { unhalt(); return; }
+  halted = false;                 // a frame is arriving, so the drive is live
   if (last && d.seq < last.seq) { $('inc').hidden = true; }  // new drive, clear stale incident
   last = d;
   $('seq').textContent  = 'seq ' + d.seq;
@@ -149,6 +163,10 @@ $('no').onclick  = () => $('dlg').close();
 const TOKEN = '__REVERT_TOKEN__';   // minted per server start, served only here
 
 const BTN_LABEL = $('btn').textContent;
+// Same reason as the label above: the hint is the only place the page explains
+// what the red button does to the record and what it does not do to the world.
+// unhalt() used to blank it, destroying that explanation for good.
+const HINT_TEXT = $('hint').textContent;
 
 $('yes').onclick = async () => {
   $('dlg').close();
@@ -169,7 +187,7 @@ $('yes').onclick = async () => {
     refused(body && body.refused ? body.refused : 'HTTP ' + r.status);
     return;
   }
-  halt(JSON.stringify(body));
+  halt(noteFor(body.record_frozen_at_seq));
 };
 
 $('resume').onclick = async () => {
@@ -184,25 +202,40 @@ $('resume').onclick = async () => {
   location.reload();
 };
 
+// The sentence the server broadcasts to every other tab. This tab used to
+// hand itself JSON.stringify(body) instead -- a raw response object on the
+// operator's hint line, where every other tab got prose. The seq comes from
+// the response, never from the dialog: the dialog snapshots `behind` and
+// `last_good_seq` at click and the drive keeps committing frames while it
+// sits open, so what it predicted and what was actually frozen differ by
+// however long the human took to decide.
+function noteFor(seq) {
+  return 'minimal-risk manoeuvre engaged; record frozen at seq ' + seq;
+}
+
 function halt(note) {
+  halted = true;
   $('resume').hidden = false;
   $('conn').textContent = 'HALTED';
   $('btn').disabled = true;
-  $('btn').textContent = 'reverted , record frozen';
+  $('btn').textContent = 'reverted, record frozen';
   $('hint').textContent = note;
 }
 
 function unhalt() {
+  halted = false;
   $('resume').hidden = true;
   $('conn').textContent = 'streaming @ 10 Hz';
   $('btn').disabled = false;
   $('btn').textContent = BTN_LABEL;
-  $('hint').textContent = '';
+  $('hint').textContent = HINT_TEXT;
 }
 
 // The button stays live and says why. Leaving it disabled after a refusal
 // meant the operator could not try again without reloading the page.
 function refused(why) {
+  halted = false;             // refused means nothing was halted; say so, and
+                              // do not let a reconnect claim HALTED afterwards
   $('conn').textContent = 'halt REFUSED';
   $('btn').disabled = false;
   $('btn').textContent = BTN_LABEL;

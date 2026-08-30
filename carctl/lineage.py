@@ -39,11 +39,17 @@ def models_at(repo: str, rev: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def changes(old: str | None, new: str) -> list[tuple[str, str | None, str]]:
+def changes(old: str | None,
+            new: str) -> list[tuple[str, str | None, str | None]]:
     """(subsystem, checkpoint before, checkpoint after) for what moved.
 
     `old` is None for the first entry on the ref, where every subsystem is
     being recorded rather than promoted.
+
+    The union of both sides, not just the new one: a subsystem that is dropped
+    from models.json is as much a change to what is in force as one that moves,
+    and iterating only `after` reported the retirement as nothing happening.
+    An `after` of None is that retirement.
     """
     try:
         before = json.loads(old) if old else {}
@@ -52,27 +58,41 @@ def changes(old: str | None, new: str) -> list[tuple[str, str | None, str]]:
         # record the whole set rather than silently reporting no promotions.
         before = {}
     after = json.loads(new)
-    return [(k, before.get(k), v) for k, v in sorted(after.items())
-            if before.get(k) != v]
+    return [(k, before.get(k), after.get(k))
+            for k in sorted(set(before) | set(after))
+            if before.get(k) != after.get(k)]
 
 
-def message(changed: list[tuple[str, str | None, str]], when_unix: int,
+def message(changed: list[tuple[str, str | None, str | None]], when_unix: int,
             drive_tag: str, seq: int) -> str:
     """The commit body. Everything blame reports later comes from here."""
     if not changed:
         raise ValueError("a lineage commit with no promotion in it")
     if len(changed) == 1:
         subsystem, before, after = changed[0]
-        subject = (f"record {subsystem} at {after}" if before is None
-                   else f"promote {subsystem} to {after}")
+        if after is None:
+            subject = f"retire {subsystem}"
+        elif before is None:
+            subject = f"record {subsystem} at {after}"
+        else:
+            subject = f"promote {subsystem} to {after}"
     else:
         names = ", ".join(c[0] for c in changed)
-        verb = "record" if all(c[1] is None for c in changed) else "promote"
+        # Three verbs, because a set that is entirely appearing and a set that
+        # is entirely going away are different events, and "promote" describes
+        # neither. Mixed sets keep the general word.
+        if all(c[1] is None for c in changed):
+            verb = "record"
+        elif all(c[2] is None for c in changed):
+            verb = "retire"
+        else:
+            verb = "promote"
         subject = f"{verb} {len(changed)} checkpoints: {names}"
     when = datetime.datetime.fromtimestamp(when_unix).astimezone()
     lines = [subject, ""]
     for subsystem, before, after in changed:
-        lines.append(f"Promoted: {subsystem} {before or '(none)'} -> {after}")
+        lines.append(f"Promoted: {subsystem} {before or '(none)'} -> "
+                     f"{after if after is not None else '(retired)'}")
     # The commit timestamp says the same thing, but this ref outlives every
     # tool that wrote it and a trailer survives a rewrite of committer dates.
     lines.append(f"Promoted-At: {when.isoformat(timespec='seconds')}")

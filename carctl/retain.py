@@ -18,7 +18,9 @@ splits by file rather than by time:
 The window is a forensics judgement, not a derived number: it is how long
 after an incident somebody might still want 10 Hz poses on the vehicle. The
 lineage half is derived and firm, and it is the half that makes the window
-safe to shorten.
+safe to shorten. It is the single knob here, settable per run with --days or
+per environment with CARCTL_WINDOW_DAYS; every pass reports which of the three
+it used, because the window is what decides that frames stop existing.
 
 Pruning is done with a shallow boundary rather than a rewrite, because a
 rewrite changes every surviving commit's sha, and a sha is a frame's identity
@@ -44,10 +46,12 @@ stalled-disk scenario the bounded queue drops frames on, so repacking during a
 drive would manufacture the failure the architecture exists to survive.
 """
 from __future__ import annotations
-import contextlib, json, os, stat, subprocess, time
+import contextlib, json, math, os, stat, subprocess, time
 from . import lineage, publish
 
 MAIN_WINDOW_DAYS = 14
+# The one knob, and where it can be turned from without passing --days.
+WINDOW_ENV = "CARCTL_WINDOW_DAYS"
 # km/h. Below this the wheels are not turning and maintenance may run.
 STATIONARY_KMH = 1.0
 LOCK_NAME = "carctl-drive.lock"
@@ -65,7 +69,19 @@ MIN_GEOMETRIC_GIT = (2, 32)
 class MaintenanceError(Exception):
     """A step could not be completed. Never reported as "nothing to do": a
     gate that answers the same way when it passes and when it never ran is
-    worse than no gate."""
+    worse than no gate.
+
+    `report` carries whatever the failing pass had already accumulated, and
+    `destructive` says it had already changed the repository when it failed.
+    An exception that arrives with neither leaves the caller unable to tell a
+    refusal from a half-finished prune, and those need opposite responses.
+    """
+
+    def __init__(self, msg: str, report: list[str] | None = None,
+                 destructive: bool = False):
+        super().__init__(msg)
+        self.report = list(report or [])
+        self.destructive = destructive
 
 
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
@@ -160,6 +176,38 @@ def stationary(repo: str) -> tuple[bool, str]:
 
 # ---------------------------------------------------------------------------
 # Where the window falls.
+
+def resolve_window_days(days: float | None) -> tuple[float, str]:
+    """The retention window in days, and where the number came from.
+
+    Three sources in descending order: --days, the environment, the built-in
+    default. The source is returned because the window decides what is
+    destroyed, and a report that says "14 days" without saying who chose 14
+    cannot be audited after the frames are gone.
+
+    A malformed environment value is an error, not a fallback. Silently
+    reverting to 14 would be the one outcome nobody notices, and the failure it
+    hides -- a window shortened or garbled by ambient config -- destroys frames
+    that were meant to be kept.
+    """
+    if days is not None:
+        return days, "--days"
+    raw = os.environ.get(WINDOW_ENV)
+    if raw is None or not raw.strip():
+        return MAIN_WINDOW_DAYS, "MAIN_WINDOW_DAYS default"
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        raise MaintenanceError(
+            f"{WINDOW_ENV}={raw!r} is not a usable retention window; it must "
+            "be a positive number of days. Refusing rather than falling back "
+            f"to {MAIN_WINDOW_DAYS}: a window this pass reads out of the "
+            "environment decides which frames are destroyed, and one that is "
+            "garbled has to be loud")
+    return value, WINDOW_ENV
+
 
 def _drive_tags(repo: str) -> list[tuple[int, str]]:
     """Drive tags sorted by number. Lexical order puts drive-0010 before
@@ -312,14 +360,17 @@ def unrecorded_promotions(repo: str, cut: str,
     match, and blaming an old incident with a promotion that had not happened
     yet is the confident wrong answer this whole split exists to avoid.
     """
-    has_parent = _out(repo, "rev-list", "--max-parents=1", "--max-count=1",
+    # --min-parents, not --max-parents. A root commit has zero parents, which
+    # is <= 1, so the max form matched every cut there has ever been and the
+    # guard below it could never fire.
+    has_parent = _out(repo, "rev-list", "--min-parents=1", "--max-count=1",
                       cut).strip()
     if not has_parent:
         return []                      # cut is the root; nothing is dropped
     raw = _git(repo, "log", "--format=%x01%H %ct", "--raw", "--no-abbrev",
                "--no-renames", f"{cut}^", "--", "models.json")
     if raw.returncode != 0:
-        return []                      # no parent, so nothing below the cut
+        return []                      # `{cut}^` does not resolve; nothing below
     known = lineage.index(repo)
     missing, ct = [], 0
     for line in raw.stdout.splitlines():
@@ -411,55 +462,64 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
         report.append("dry run, nothing changed")
         return report, False
 
-    for name in doomed:
-        _out(repo, "update-ref", "-d", name)
-    # The shallow boundary. `git repack` honours it, unlike a replace-ref
-    # graft, so the dropped commits actually leave the pack.
-    shallow = os.path.join(
-        _out(repo, "rev-parse", "--absolute-git-dir").strip(), "shallow")
-    # Added, not replaced. A repo can already be shallow for a reason
-    # that is not ours, a --depth clone among them, and dropping
-    # somebody else's boundary leaves git expecting parents that are not
-    # there. A stale entry for a commit that is gone is ignored, so
-    # keeping one costs nothing.
-    have = []
+    # From here on the repository is being changed, and a failure partway
+    # leaves it in a state the caller has to be told about rather than handed
+    # as a bare "not pruned". The report accumulated above is the only account
+    # of how far it got, so it travels with the exception.
     try:
-        with open(shallow, encoding="utf-8") as fh:
-            have = [line.strip() for line in fh if line.strip()]
-    except OSError:
-        pass
-    if cut not in have:
-        have.append(cut)
-    with open(shallow, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("".join(line + "\n" for line in have))
-    # public is a scrubbed copy of main and inherits its retention. Rebuilt
-    # rather than deleted, because leaving a full-length copy of the frames we
-    # just dropped on another ref reclaims nothing.
-    logs = ["HEAD", "refs/heads/main"]
-    if _git(repo, "rev-parse", "--verify", "--quiet",
-            "refs/heads/public").returncode == 0:
-        publish.build_public_ref(repo)
-        report.append("rebuilt refs/heads/public from the pruned main")
-        # Only after that rebuild succeeded. publish.py keeps the previous
-        # public ref reachable through its reflog precisely so a failed
-        # rebuild has something to fall back to, and every one of those older
-        # entries is a full-length copy of the frames this pass is dropping.
-        # There is a good public ref now, so the fallback's job is done.
-        logs.append("refs/heads/public")
-    # These reflogs and no others. `--all` would take refs/heads/src with it,
-    # which is source history's safety net and has nothing to do with the
-    # retention window. HEAD is here because it is checked out on main and its
-    # reflog pins every frame we are dropping.
-    report.append("expiring the reflogs of " + ", ".join(logs))
-    _out(repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now",
-         *logs)
-    before = _disk(repo)
-    # The one place a full repack is right: it is what actually drops the
-    # objects, and it runs at most once per window rather than after every
-    # drive.
-    _out(repo, "repack", "-a", "-d", "--unpack-unreachable=now")
-    _out(repo, "prune", "--expire=now")
-    report.append(f"pack {before} -> {_disk(repo)}")
+        for name in doomed:
+            _out(repo, "update-ref", "-d", name)
+        # The shallow boundary. `git repack` honours it, unlike a replace-ref
+        # graft, so the dropped commits actually leave the pack.
+        shallow = os.path.join(
+            _out(repo, "rev-parse", "--absolute-git-dir").strip(), "shallow")
+        # Added, not replaced. A repo can already be shallow for a reason
+        # that is not ours, a --depth clone among them, and dropping
+        # somebody else's boundary leaves git expecting parents that are not
+        # there. A stale entry for a commit that is gone is ignored, so
+        # keeping one costs nothing.
+        have = []
+        try:
+            with open(shallow, encoding="utf-8") as fh:
+                have = [line.strip() for line in fh if line.strip()]
+        except OSError:
+            pass
+        if cut not in have:
+            have.append(cut)
+        with open(shallow, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("".join(line + "\n" for line in have))
+        # public is a scrubbed copy of main and inherits its retention. Rebuilt
+        # rather than deleted, because leaving a full-length copy of the frames
+        # we just dropped on another ref reclaims nothing.
+        logs = ["HEAD", "refs/heads/main"]
+        if _git(repo, "rev-parse", "--verify", "--quiet",
+                "refs/heads/public").returncode == 0:
+            publish.build_public_ref(repo)
+            report.append("rebuilt refs/heads/public from the pruned main")
+            # Only after that rebuild succeeded. publish.py keeps the previous
+            # public ref reachable through its reflog precisely so a failed
+            # rebuild has something to fall back to, and every one of those
+            # older entries is a full-length copy of the frames this pass is
+            # dropping. There is a good public ref now, so the fallback's job
+            # is done.
+            logs.append("refs/heads/public")
+        # These reflogs and no others. `--all` would take refs/heads/src with
+        # it, which is source history's safety net and has nothing to do with
+        # the retention window. HEAD is here because it is checked out on main
+        # and its reflog pins every frame we are dropping.
+        report.append("expiring the reflogs of " + ", ".join(logs))
+        _out(repo, "reflog", "expire", "--expire=now",
+             "--expire-unreachable=now", *logs)
+        before = _disk(repo)
+        # The one place a full repack is right: it is what actually drops the
+        # objects, and it runs at most once per window rather than after every
+        # drive.
+        _out(repo, "repack", "-a", "-d", "--unpack-unreachable=now")
+        _out(repo, "prune", "--expire=now")
+        report.append(f"pack {before} -> {_disk(repo)}")
+    except MaintenanceError as exc:
+        raise MaintenanceError(str(exc), report=report,
+                               destructive=True) from exc
     return report, True
 
 
@@ -511,11 +571,22 @@ def _disk(repo: str) -> str:
     return f"{total / 1e6:.1f} MB"
 
 
-def maintain(repo: str, days: float = MAIN_WINDOW_DAYS,
+def maintain(repo: str, days: float | None = None,
              dry_run: bool = False) -> list[str]:
-    """The whole stationary-only maintenance pass."""
+    """The whole stationary-only maintenance pass.
+
+    `days` of None means "whatever resolve_window_days decides", which is the
+    environment or the built-in default. Its MaintenanceError is deliberately
+    not caught here: an unusable window is a reason not to start, and the
+    caller reports it.
+    """
+    days, source = resolve_window_days(days)
     ok, why = stationary(repo)
     report = [f"stationary check: {why}"]
+    # Stated, not implied. The window is what decides which frames stop
+    # existing, and a report that has to be read months later cannot go and ask
+    # what the environment held at the time.
+    report.append(f"window: {days:g} day(s) ({source})")
     if not ok:
         report.append("refusing to touch the object store while the vehicle "
                       "is not stopped")
@@ -526,12 +597,36 @@ def maintain(repo: str, days: float = MAIN_WINDOW_DAYS,
         # A retention gate that refuses is not a reason to skip the pack
         # maintenance. Packs bite before the disk does, and the two halves
         # fail independently.
-        pruned, repacked = [f"not pruned: {exc}"], False
+        repacked = False
+        if exc.destructive:
+            # It got past the point of no return. Saying only "not pruned"
+            # here would be a lie in the direction that matters: refs are gone
+            # and the boundary is written, so what the operator needs is the
+            # account of how far it got and the fact that finishing the job is
+            # a re-run, not a repair.
+            pruned = exc.report + [
+                f"prune failed PARTWAY: {exc}",
+                "the doomed refs are already deleted and the shallow boundary "
+                "is already written, so the objects below the cut are "
+                "unreachable but still on disk; once the cause above is "
+                "cleared, running maintain again finishes the job"]
+        else:
+            pruned = [f"not pruned: {exc}"]
     report += pruned
-    report += [] if repacked else repack(repo, dry_run)
+    if not repacked:
+        try:
+            report += repack(repo, dry_run)
+        except MaintenanceError as exc:
+            # Same independence, one level down: a repack that cannot run is a
+            # line in the report, not a traceback out of a maintenance pass
+            # that has already done destructive work worth reading about.
+            report.append(f"repack failed: {exc}")
     if not dry_run:
         # Last, and after both halves: either can invalidate them.
-        report.append(refresh_commit_graph(repo))
-        _out(repo, "multi-pack-index", "write")
-        report.append("multi-pack-index rewritten")
+        try:
+            report.append(refresh_commit_graph(repo))
+            _out(repo, "multi-pack-index", "write")
+            report.append("multi-pack-index rewritten")
+        except MaintenanceError as exc:
+            report.append(f"cache refresh failed: {exc}")
     return report

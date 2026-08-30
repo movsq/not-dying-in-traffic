@@ -39,12 +39,20 @@ class Preconditions:
             c.append("vehicle in front moved")
         if abs(other.follow_vehicle_x - self.follow_vehicle_x) > 0.5:
             c.append("vehicle behind moved")
-        # Relative, not absolute. The absolute floor fired on gaps that were
-        # always tight and stayed that way, and stayed silent on a clearance
-        # that halved while remaining above it.
-        if other.clearance_m < min(0.3, self.clearance_m - 0.15):
+        # Two independent tests, because clearance fails in two ways. The
+        # floor is an absolute one that adapts downward: a gap already tighter
+        # than 0.3 m at push time gets its own value as the floor, minus 5 cm
+        # of lidar jitter, so a tight-but-stable park is not reported as a
+        # conflict on noise alone. Subtracting the tolerance INSIDE the min()
+        # was what broke it -- a 0.20 m push produced a floor of 0.05 m, and
+        # nothing this side of the bumper could trip it.
+        #
+        # The second test is proportional, not a fixed 0.15 m: a third of the
+        # room gone is the same event whether it started at 0.2 m or at 1 m,
+        # and an absolute tolerance can only be tuned right for one of those.
+        if other.clearance_m < min(0.3, self.clearance_m) - 0.05:
             c.append(f"clearance {other.clearance_m:.2f}m below margin")
-        elif other.clearance_m < self.clearance_m - 0.15:
+        elif other.clearance_m < 0.7 * self.clearance_m:
             c.append(f"clearance shrank {self.clearance_m:.2f}m -> "
                      f"{other.clearance_m:.2f}m")
         return c

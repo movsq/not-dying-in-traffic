@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "not-dying-in-traffic"
+version = "0.1.0"
+description = "A car whose state history is a git history."
+readme = "README.md"
+requires-python = ">=3.9"
+# Stdlib only, on purpose. The control loop has a 100 ms budget and the record
+# plane talks to git over a pipe; a dependency that can be installed at a
+# different version than it was tested at is a dependency that can miss a
+# deadline. Anything listed here would have to earn it.
+dependencies = []
+
+[project.scripts]
+carctl = "carctl.cli:main"
+
+[tool.setuptools]
+# Listed, not autodiscovered. `dashboard/` is a pair of scripts, not a package:
+# it has no __init__.py and puts the repo root on sys.path itself at startup.
+# Flat-layout autodiscovery sees two top-level directories, refuses to guess,
+# and fails the build -- and the one way it could guess is to ship the
+# dashboard as an importable package it was never written to be.
+packages = ["carctl"]

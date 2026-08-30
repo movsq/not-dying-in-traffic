@@ -56,6 +56,58 @@ def _where_to_blame(repo: str, sha: str) -> tuple[str, str]:
     return entry, ""
 
 
+# The order the fields read in, ahead of anything the registry grows later.
+# Not a schema, and not a requirement: an entry carries whatever whoever
+# promoted the model bothered to record, so every field here is optional and
+# an unknown one still gets printed rather than dropped.
+_FIELDS = ("trained", "dataset", "shadow_km", "gate_km", "status", "notes")
+
+
+def _provenance(entry) -> str:
+    """A registry entry as one line a person reads at 3am.
+
+    This used to be the raw dict, printed straight into the incident report:
+    the single line of that report that answers "why was this model in the
+    car", rendered as `{'trained': '2026-07-14', 'dataset': ...}` with the two
+    numbers that matter, shadow kilometres against the gate they were supposed
+    to clear, sitting unrelated somewhere in the middle of it.
+    """
+    if not isinstance(entry, dict):
+        return str(entry)          # "not in registry", or a bare note
+    shadow, gate = entry.get("shadow_km"), entry.get("gate_km")
+    # Only a pair says anything. A shadow figure with no gate to hold it
+    # against is a number, and a gate with nothing measured against it is a
+    # policy; either alone gets reported as the plain field it is.
+    paired = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                 for v in (shadow, gate))
+    bits = []
+    for key, value in sorted(entry.items(), key=_field_order):
+        if key == "gate_km" and paired:
+            continue               # said in the shadow_km field
+        if key == "shadow_km" and paired:
+            if shadow < gate:
+                bits.append(f"shadow_km {_km(shadow)} of a {_km(gate)} km "
+                            "gate, promoted anyway")
+            else:
+                bits.append(f"shadow_km {_km(shadow)} over a {_km(gate)} km "
+                            "gate")
+            continue
+        bits.append(f"{key} {value}")
+    return ", ".join(bits) if bits else "registry entry is empty"
+
+
+def _km(n) -> str:
+    """A distance, written the way the registry writes it. `f"{1180000:g}"`
+    comes out 1.18e+06, and an exponent in the middle of a sentence about
+    shadow coverage is a number nobody reads."""
+    return f"{n:.0f}" if float(n) == int(n) else f"{n}"
+
+
+def _field_order(item) -> tuple[int, str]:
+    key = item[0]
+    return (_FIELDS.index(key) if key in _FIELDS else len(_FIELDS), key)
+
+
 def attribute(repo: str, sha: str, subsystem: str) -> dict:
     n = line_of(repo, sha, subsystem)
     if n is None:
@@ -79,7 +131,22 @@ def attribute(repo: str, sha: str, subsystem: str) -> dict:
         if line.startswith("committer-time "):
             meta["promoted_at_unix"] = int(line.split()[1])
         if line.startswith("\t"):
-            meta["checkpoint"] = line.strip().split('"')[3]
+            # The porcelain content line is the models.json line itself,
+            # `  "perception": "ckpt-...",` behind a tab, so parse it as the
+            # JSON it is. Splitting on quote characters and taking [3] threw
+            # away exactly the escaping state.py's models_json() exists to
+            # produce: a checkpoint id containing a quote is one field to a
+            # JSON reader and four fragments to that split, and the answer it
+            # returned was the fragment before the quote.
+            frag = line[1:].strip().rstrip(",")
+            try:
+                pair = json.loads("{" + frag + "}")
+            except ValueError:
+                # Not our line format at all. The raw fragment is a worse
+                # answer than a parsed one and a much better answer than none.
+                meta["checkpoint"] = frag
+            else:
+                meta["checkpoint"] = next(iter(pair.values()), frag)
     # The drive is a name in the body, not a ref: retention deletes the tag
     # with the frames it bounds, and the promotion outlives both.
     for line in _git(repo, "log", "-1", "--format=%B", culprit).splitlines():
@@ -88,8 +155,22 @@ def attribute(repo: str, sha: str, subsystem: str) -> dict:
 
     reg = pathlib.Path(repo, "models", "registry.json")
     if reg.exists() and "checkpoint" in meta:
-        registry = json.loads(reg.read_text())
-        meta["provenance"] = registry.get(meta["checkpoint"], "not in registry")
+        # encoding="utf-8" explicitly: read_text() otherwise decodes with the
+        # locale codec, which is cp1252 on this machine, and a registry note
+        # carrying anything outside it raises UnicodeDecodeError in the middle
+        # of an incident report. A registry that cannot be read is a missing
+        # explanation, not a failed attribution -- everything above it is
+        # already correct -- so it is reported in the field it belongs to
+        # rather than taking the report down with it.
+        try:
+            registry = json.loads(reg.read_text(encoding="utf-8"))
+            if not isinstance(registry, dict):
+                raise ValueError("not a JSON object of checkpoint entries")
+            entry = registry.get(meta["checkpoint"], "not in registry")
+        except (OSError, ValueError) as exc:
+            meta["provenance"] = f"registry unreadable: {exc}"
+        else:
+            meta["provenance"] = _provenance(entry)
     return meta
 
 

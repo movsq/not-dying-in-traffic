@@ -19,7 +19,7 @@ N_LANES = 2        # per road, numbered rightward from 0
 # trigger, and the planner was the one subsystem blame never got asked about.
 ROADS = {
     "Vinohradská": ((0.0, 0.0), 0.0),
-    "Hlavní":      ((41.8, 0.0), math.pi / 2),
+    "Ječná":       ((41.8, 0.0), math.pi / 2),
 }
 
 # A junction is where a straight centreline per street runs out. The two turn
@@ -32,13 +32,13 @@ ROADS = {
 #
 #   name -> (entry road, entry lane, exit road, exit lane)
 JUNCTIONS = {
-    "Vinohradská>Hlavní": ("Vinohradská", 0, "Hlavní", 0),
+    "Vinohradská>Ječná": ("Vinohradská", 0, "Ječná", 0),
 }
 
 # Radius of that arc at the lane centre. A turn has to be driven at some
 # radius, and this one is picked to sit inside the box the two streets cross
 # in: at 10 m the arc leaves Vinohradská 10 m short of the intersection and
-# joins Hlavní 10 m past it.
+# joins Ječná 10 m past it.
 JUNCTION_RADIUS = 10.0   # m
 
 # The scripted drive.
@@ -51,31 +51,53 @@ JUNCTION_RADIUS = 10.0   # m
 SCRIPT = [
     (0.0,  "Vinohradská", "cruise",      0.00, 13.9, 0),
     (1.5,  "Vinohradská", "brake",       0.00,  6.0, 0),
-    (2.5,  "Hlavní"     , "turn_left",   0.00,  5.0, "Vinohradská>Hlavní"),
-    (4.5,  "Hlavní",      "turn_left",   0.00,  6.0, "Vinohradská>Hlavní"),
-    (5.5,  "Hlavní",      "cruise",      0.00, 12.0, 0),
-    (7.0,  "Hlavní",      "cruise",      0.00, 13.5, 0),
-    # The planner asks for lane 2.3 on a two lane road. This is the planner
+    (2.5,  "Ječná",       "turn_left",   0.00,  5.0, "Vinohradská>Ječná"),
+    (4.5,  "Ječná",       "turn_left",   0.00,  6.0, "Vinohradská>Ječná"),
+    (5.5,  "Ječná",       "cruise",      0.00, 12.0, 0),
+    (7.0,  "Ječná",       "cruise",      0.00, 13.5, 0),
+    # The planner asks for lane 2.6 on a two lane road. This is the planner
     # fault the drive exists to exercise, and it is the mirror of the
     # perception one: a bad target, held long enough to leave the roadway,
     # then corrected. `off_road` fires while the car is out there and
     # OWNER maps it to the planner.
-    (9.0,  "Hlavní",  "lane_change_right", 0.00, 12.0, 2.6),
-    (10.6, "Hlavní",      "cruise",      0.00, 12.0, 1),
-    (11.5, "Hlavní",      "brake",       0.00,  2.0, 1),
-    (12.5, "Hlavní",      "park",       -0.35,  1.5, None),
-    # Past the end of the 14 s drive, so it changes nothing about that one.
-    # A car that never comes to rest is a car maintenance can never run on:
-    # retain.stationary() reads the last committed frame's speed, and the
-    # scripted park settles at 1.5 m/s and holds it forever. It also gives
-    # msgen's "stop" verb something to describe, which nothing produced.
-    (14.0, "Hlavní",      "stop",        0.00,  0.0, None),
+    (9.0,  "Ječná",   "lane_change_right", 0.00, 12.0, 2.6),
+    (10.6, "Ječná",       "cruise",      0.00, 12.0, 1),
+    (11.5, "Ječná",       "brake",       0.00,  2.0, 1),
+    (12.5, "Ječná",       "park",       -0.35,  1.5, None),
+    # The default drive runs 17 s and reaches this row, which is the point of
+    # it: a car that never comes to rest is a car maintenance can never run
+    # on. retain.stationary() reads the last committed frame's speed, and the
+    # scripted park settles at 1.5 m/s and holds it forever, so a drive that
+    # ended at 14.0 left the last frame rolling at ~9 km/h and the stationary
+    # gate could never pass afterwards. It also gives msgen's "stop" verb
+    # something to describe, which nothing produced.
+    (14.0, "Ječná",       "stop",        0.00,  0.0, None),
 ]
 
 # The stop line the car is going to blow through, because the perception
 # checkpoint below mis-classifies amber as green under low sun.
-STOP_LINE_S = 108.0   # m along Hlavní
+STOP_LINE_S = 108.0   # m along Ječná
+# The amber phase is the one a car can still act on. It exists because the
+# checkpoint's failure is an amber/green confusion and there was no amber to
+# confuse: the light went green -> red 10 m in front of a car doing 43 km/h,
+# which no perception model, good or bad, could have stopped for. With the
+# phase in, the good checkpoint sees the amber 24 m out and stops; the bad one
+# reports green through it. That difference is the whole experiment `carctl
+# replay` runs.
+LIGHT_AMBER_AT = 9.0   # s
 LIGHT_RED_AT = 10.2    # s
+
+# Where things are, not when they happen. These were time gates once, which
+# made the world a stage rig: the van "appeared" at 10.0 s whether or not the
+# car was anywhere near it, so a replay that stopped for the amber still
+# collided, on schedule, with a van 9 m ahead of where it stood. Tied to
+# s_along they are places the car has to reach, and a drive that stops short
+# of them records no incident -- which is what lets `carctl replay
+# --assert-no-incident` mean what it says with no --kind filter.
+VAN_S      = 107.7   # m; the van in the right lane the planner steers into
+PARK_BAY_S = 122.2   # m; where the parking bay starts
+BAY_VAN_S  = 130.7   # m; the van the parking manoeuvre squeezes in behind
+CURB_S     = 125.1   # m; the curb at the bay's edge
 
 CHECKPOINTS = {
     "controller": "ckpt-controller-2026.03.01-0b12",
@@ -260,15 +282,29 @@ class Plant:
         self.seq = 0
         self.s_along = 0.0  # arc length, used to place the stop line
         self.prev_light_dist = STOP_LINE_S
-        self.checkpoints = dict(checkpoints or CHECKPOINTS)
+        # A set passed in is PINNED: it is held for the whole run and the
+        # scripted OTA swap below does not happen. That is what `carctl
+        # replay` asks for -- "what would this drive have done with the
+        # checkpoint set this frame committed" -- and a swap six seconds in
+        # answers a different question, by running the promoted checkpoint
+        # whatever was handed in. None means the ordinary drive: start on
+        # CHECKPOINTS and take the swap when it comes.
+        self.pinned = checkpoints is not None
+        self.checkpoints = dict(CHECKPOINTS if checkpoints is None
+                                else checkpoints)
 
     def _light(self) -> tuple[str, float]:
-        true_state = "red" if self.t >= LIGHT_RED_AT else "green"
+        true_state = self.true_light()
         dist = STOP_LINE_S - self.s_along
-        # The bug lives here: this perception checkpoint reports the light as
-        # green for 1.2 s after it turns red. Everything downstream is correct.
-        if self.checkpoints["perception"] == "ckpt-perception-2026.07.14-a91f":
-            if true_state == "red" and self.t < LIGHT_RED_AT + 1.2:
+        # The bug lives here: this perception checkpoint reads amber as green
+        # under a low west sun, and goes on reading the red that follows as
+        # green for 1.2 s. Everything downstream is correct, and acts on this.
+        # Compared against OTA_SWAP rather than a second copy of the id: a
+        # typo in a literal here is a bug that silently never fires, and it
+        # would look exactly like the checkpoint being harmless.
+        if self.checkpoints.get("perception") == OTA_SWAP[1]:
+            if true_state == "amber" or (true_state == "red"
+                                         and self.t < LIGHT_RED_AT + 1.2):
                 return "green", dist
         return true_state, dist
 
@@ -286,15 +322,34 @@ class Plant:
                               + 0.05 * -off + 0.9 * head))
 
     def true_light(self) -> str:
-        return "red" if self.t >= LIGHT_RED_AT else "green"
+        if self.t >= LIGHT_RED_AT:
+            return "red"
+        return "amber" if self.t >= LIGHT_AMBER_AT else "green"
 
     def step(self) -> Frame:
-        if self.t >= OTA_SWAP_AT and self.checkpoints[OTA_SWAP[0]] != OTA_SWAP[1]:
+        if (not self.pinned and self.t >= OTA_SWAP_AT
+                and self.checkpoints.get(OTA_SWAP[0]) != OTA_SWAP[1]):
             self.checkpoints = dict(self.checkpoints)
             self.checkpoints[OTA_SWAP[0]] = OTA_SWAP[1]
 
         t0, road, maneuver, steer_cmd, v_target, spec = _script_at(self.t)
         path = path_for(road, spec)
+
+        # What perception is reporting at the top of the tick, which is the
+        # only light reading the controller can act on. The frame below
+        # records the reading taken after the integration instead, because
+        # that is the one that describes where the car ended up.
+        seen_state, seen_dist = self._light()
+        # Stop for a light perception says is not green while the stop line is
+        # still ahead. This is the one path from the checkpoint set to the
+        # actuators, and without it the checkpoint set causes nothing: the
+        # speed was scripted end to end, so the car ran the light in exactly
+        # the same way whichever perception model was loaded, and `carctl
+        # replay` could pin either one and get an identical drive. Ground
+        # truth is deliberately not consulted here -- the car acts on what it
+        # was told, which is what makes a misclassification expensive.
+        if seen_state in ("amber", "red") and seen_dist > 0:
+            v_target = 0.0
 
         # Longitudinal: crude P controller onto the scripted target speed.
         err = v_target - self.pose.v
@@ -322,21 +377,23 @@ class Plant:
         self.pose = Pose(x=x, y=y, heading=heading, v=v, steer=steer)
 
         light_state, light_dist = self._light()
-        # A parked van appears at 12.0 s; that is what the parking manoeuvre
-        # is squeezing in behind.
         lidar = 40.0
         # Something is already occupying the space the planner steered into.
         # The excursion is what brings the car inside MIN_CLEARANCE of it, so
         # the near miss is downstream of the planner fault and prediction owns
         # it. Without this, `collision` is the incident kind nothing triggers:
         # a successful parallel park used to stand in for one, which is the
-        # false positive PARK_CLEARANCE exists to stop.
-        if 10.0 <= self.t < 11.1:
-            lidar = max(1.2, 12.0 - (self.t - 10.0) * 14.0)
-        if self.t >= 11.8:
-            lidar = max(1.4, 14.0 - (self.t - 11.8) * 6.0)
+        # false positive PARK_CLEARANCE exists to stop. The floor is the
+        # swerve back into lane: the car clears the van, barely.
+        gap = VAN_S - self.s_along
+        if 0 < gap <= 12.0:
+            lidar = max(1.2, gap)
+        # The van ahead of the parking bay, in the forward cone on approach.
+        gap = BAY_VAN_S - self.s_along
+        if 0 < gap <= 14.0:
+            lidar = min(lidar, max(1.4, gap))
         curb = 0.0
-        if maneuver == "park" and self.t >= 13.1:
+        if maneuver == "park" and self.s_along >= CURB_S:
             curb = 41.0  # curb strike: irreversible, and the IMU says so
 
         # With no reference path there is nothing honest to report, and that
@@ -352,9 +409,11 @@ class Plant:
 
         # Something is behind us during the parking manoeuvre. The forward
         # cone cannot see it, which is the whole reason this reading exists.
+        # Keyed to progress into the bay, not to the clock: a car that never
+        # made it this far has nothing creeping up behind it.
         lidar_rear = 40.0
-        if maneuver == "park":
-            lidar_rear = max(0.8, 5.0 - (self.t - 12.5) * 3.0)
+        if maneuver == "park" and self.s_along > PARK_BAY_S:
+            lidar_rear = max(0.8, 5.0 - (self.s_along - PARK_BAY_S) * 1.6)
 
         sensors = Sensors(
             lidar_min_range=lidar,

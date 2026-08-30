@@ -78,7 +78,6 @@ def drive(repo: str, seconds: float, realtime: bool = True,
     plant = Plant()
     tag = _next_drive_tag(repo)
     committer = Committer(repo, drive_tag=tag)
-    committer.start()
     rep = DriveReport()
 
     # kind -> tick it was last true. A set that was only added to could never
@@ -101,6 +100,12 @@ def drive(repo: str, seconds: float, realtime: bool = True,
     # Advisory one way only: it never blocks the drive, and it expires on its
     # own so a power cut cannot leave the vehicle unable to repack.
     with retain.drive_lock(repo, seconds):
+        # Started here, not before the lock. Entering drive_lock resolves the
+        # git dir, which raises if git is missing or this is not a repository
+        # -- and started first, the fast-import child was already running with
+        # nothing left to write `done` to it, so it died "stream ends early"
+        # over a failure that happened before the drive began.
+        committer.start()
         try:
             for i in range(n_ticks):
                 # Tick i is due one full period after the epoch, not at it.

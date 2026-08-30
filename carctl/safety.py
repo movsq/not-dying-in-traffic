@@ -50,6 +50,14 @@ OWNER = {
     "off_road":       "planner",
 }
 
+# Worst first, by how close the frame is to hurting someone: imminent contact
+# with another road user outranks entering a junction against a red, which
+# outranks striking a curb, which outranks drifting out of the lane. Detection
+# order is a function of which sensor is cheapest to test, which is no ranking
+# at all -- and callers that take found[0] as "the worst thing here", cli's
+# per-tick line among them, were reading exactly that.
+SEVERITY = ("collision", "red_light_run", "curb_strike", "off_road")
+
 
 @dataclass
 class Incident:
@@ -63,7 +71,11 @@ class Incident:
 
 
 def detect(f: Frame, true_light: str) -> list[Incident]:
-    """Every incident true of this frame, most severe first.
+    """Every incident true of this frame, most severe first, by SEVERITY.
+
+    "Most severe first" used to describe the order the checks happen to be
+    written in, which is not a ranking of anything; sorting is what makes the
+    sentence true, and found[0] the worst thing rather than the earliest test.
 
     This used to return on the first match. `stop_line_crossed` is true for
     exactly one tick, so a red-light run that coincided with any lidar or IMU
@@ -103,6 +115,10 @@ def detect(f: Frame, true_light: str) -> list[Incident]:
         found.append(Incident("off_road", f.seq,
                               f"lateral offset {f.sensors.lateral_offset:.2f} m "
                               f"from {f.sensors.lane_ref}"))
+    # A kind missing from SEVERITY sorts last rather than raising: a new
+    # detector that nobody ranked is still an incident.
+    found.sort(key=lambda inc: SEVERITY.index(inc.kind)
+               if inc.kind in SEVERITY else len(SEVERITY))
     return found
 
 
@@ -214,7 +230,12 @@ def physical_revert(repo: str, sha: str, now: Frame) -> RevertVerdict:
             "irreversible; the world cannot be walked back through it")
     goal, err = _state_at(repo, f"{sha}^")
     if err:
-        return RevertVerdict(False, "no parent commit to revert to")
+        # _state_at already distinguishes a missing parent from a parent whose
+        # state.json is unreadable or poseless. Replacing all three with "no
+        # parent commit" told an operator to look for a root commit while the
+        # real fault was a corrupt frame.
+        return RevertVerdict(
+            False, f"cannot read the parent frame to revert to: {err}")
     return reachable(now, goal)
 
 

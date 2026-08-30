@@ -1,0 +1,4 @@
+# Working trees here are a mix of Windows and Linux. Normalising blobs to LF
+# keeps a checkout on one from showing up as a whole-file diff on the other,
+# which would bury every real change in the record.
+* text=auto eol=lf

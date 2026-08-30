@@ -31,13 +31,23 @@ TOKEN = secrets.token_urlsafe(16)
 
 subscribers: list[queue.Queue] = []
 subs_lock = threading.Lock()
-STATE = {"halted": False, "last_good_seq": 0}
+STATE = {"halted": False, "last_good_seq": 0, "halt_note": ""}
+
+# The last telemetry frame that went out. A subscriber that connects between
+# broadcasts has to be told where the vehicle is; it cannot wait to be told.
+LAST_PAYLOAD: dict | None = None
 
 HEARTBEAT_S = 5.0          # idle gap before the stream proves it is still alive
 _STOP = object()           # sentinel: this subscriber has been dropped
 
 
 def _broadcast(payload: dict) -> None:
+    global LAST_PAYLOAD
+    if "seq" in payload:
+        # Only telemetry frames are state. "halted" and "resumed" are events:
+        # replaying one to a subscriber that arrived afterwards would announce
+        # a transition that did not happen while it was listening.
+        LAST_PAYLOAD = payload
     with subs_lock:
         targets = list(subscribers)
     dead = []
@@ -67,6 +77,28 @@ def _broadcast(payload: dict) -> None:
                 q.put_nowait(_STOP)
             except queue.Full:
                 pass
+
+
+def _seed_payload() -> dict:
+    """The first frame a new subscriber gets, written before the queue loop.
+
+    EventSource fires onopen the moment the response headers land, so the page
+    starts claiming a live stream immediately. If nothing follows -- the drive
+    is halted and nothing is being broadcast at all, or the first frame is
+    still up to 100 ms away -- the operator gets "streaming @ 10 Hz" over a
+    column of dashes and a live halt button. That is the same defect the drop
+    path above was fixed for, stale state shown as live on a safety display,
+    arriving from the other end: never having had state rather than having
+    stopped getting it. Say what is true at the moment of connection.
+    """
+    if STATE["halted"]:
+        return {"halted": True, "note": STATE["halt_note"],
+                "record_frozen_at_seq": STATE["last_good_seq"]}
+    if LAST_PAYLOAD is not None:
+        return LAST_PAYLOAD
+    # Nothing has been driven yet. There is no pose to report, but "not
+    # halted" is still a fact the page cannot work out on its own.
+    return {"halted": False}
 
 
 def _drive_forever() -> None:
@@ -183,6 +215,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             try:
+                self.wfile.write(b"data: " +
+                                 json.dumps(_seed_payload()).encode() + b"\n\n")
+                self.wfile.flush()
                 while True:
                     try:
                         data = q.get(timeout=HEARTBEAT_S)
@@ -213,6 +248,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = fh.read().replace(b"__REVERT_TOKEN__", TOKEN.encode())
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # This body carries the halt token. A cached copy is that token
+            # sitting in a disk cache long after the process that minted it
+            # exited, and the stale page served back from it is one whose
+            # every halt is refused while it looks perfectly healthy.
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -224,15 +264,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ---- writes ------------------------------------------------------------
     def do_POST(self):
-        route = self._route()
-        if route not in ("/revert-hard", "/resume"):
-            self.send_error(404); return
+        # Authorisation first, routing second. The other order answered an
+        # unauthorised POST to an unknown path with a bare 404, which
+        # contradicts the rule this module states at the top: EVERY mutating
+        # request needs a same-origin Host. A guard that only covers the paths
+        # that happen to exist is not a uniform guard, and the 404/403 split
+        # tells an unauthorised caller which routes are real.
         why = self._authorised()
         if why:
             self._deny(why); return
+        route = self._route()
+        if route not in ("/revert-hard", "/resume"):
+            self.send_error(404); return
 
         if route == "/resume":
             STATE["halted"] = False
+            STATE["halt_note"] = ""
             _broadcast({"resumed": True})
             self._json({"ok": True, "action": "resumed"})
             return
@@ -243,9 +290,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # the incident tooling. Naming it after a destructive git flag is the
         # honest label for "this ends the drive".
         STATE["halted"] = True
-        _broadcast({"halted": True,
-                    "note": "minimal-risk manoeuvre engaged; "
-                            f"record frozen at seq {STATE['last_good_seq']}"})
+        # Kept on STATE, not only broadcast. A broadcast reaches whoever was
+        # listening at the time; a page opened one second later has to be told
+        # the same sentence, and _seed_payload() is the only thing that can
+        # tell it.
+        STATE["halt_note"] = ("minimal-risk manoeuvre engaged; "
+                              f"record frozen at seq {STATE['last_good_seq']}")
+        _broadcast({"halted": True, "note": STATE["halt_note"],
+                    "record_frozen_at_seq": STATE["last_good_seq"]})
         self._json({"ok": True,
                     "action": "minimal_risk_manoeuvre",
                     "record_frozen_at_seq": STATE["last_good_seq"],

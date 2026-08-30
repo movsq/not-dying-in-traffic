@@ -29,7 +29,7 @@ class Sensors:
     # sign latches and never recovers.
     stop_line_crossed: bool = False
     # Which reference path lateral_offset was measured against: a lane centre
-    # ("Hlavní:1") or a path through a junction ("Vinohradská:0>Hlavní:0").
+    # ("Ječná:1") or a path through a junction ("Vinohradská:0>Ječná:0").
     # Empty means there was no reference, so lateral_offset is a placeholder
     # rather than a reading. The number alone cannot say which of those it is,
     # and a fabricated 0.0 reads as a perfectly held lane, which is how a

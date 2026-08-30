@@ -148,9 +148,13 @@ class Committer:
         out.append(b"\n")
         return b"".join(out)
 
-    def _emit_lineage(self, f: Frame, models: str) -> bytes:
-        """One commit carrying models.json and nothing else."""
-        changed = lineage.changes(self._models, models)
+    def _emit_lineage(self, f: Frame, models: str,
+                      changed: list[tuple[str, str | None, str | None]]) -> bytes:
+        """One commit carrying models.json and nothing else.
+
+        `changed` is passed in rather than recomputed: the caller has to look
+        at it before deciding there is a promotion to write at all.
+        """
         msg = lineage.message(changed, f.t_wall_s, self.drive_tag, f.seq)
         out = [b"commit " + self.lineage_ref + b"\n",
                b"committer " + IDENT + b" %d " % f.t_wall_s
@@ -178,13 +182,26 @@ class Committer:
                     break
                 models = f.models_json()
                 if models != self._models:
-                    # Before the frame, not after: if the stream dies here the
-                    # record shows a promotion with no frames under it, which
-                    # is readable. The other order shows frames running a
-                    # checkpoint nothing recorded shipping.
-                    stdin.write(self._emit_lineage(f, models))
-                    self._models = models
-                    self.promotions += 1
+                    changed = lineage.changes(self._models, models)
+                    if not changed:
+                        # The bytes differ but the checkpoints do not:
+                        # different key order, indentation, a key the ref
+                        # carries that the frame does not. That is not a
+                        # promotion and there is nothing to say about it, but
+                        # it must not be able to end the drive either -- an
+                        # empty change set raises out of message(), and this
+                        # thread dying at frame 0 committed the whole drive to
+                        # nothing. Take the new text as the state in force and
+                        # carry on.
+                        self._models = models
+                    else:
+                        # Before the frame, not after: if the stream dies here
+                        # the record shows a promotion with no frames under it,
+                        # which is readable. The other order shows frames
+                        # running a checkpoint nothing recorded shipping.
+                        stdin.write(self._emit_lineage(f, models, changed))
+                        self._models = models
+                        self.promotions += 1
                 stdin.write(self._emit(f))
                 self.committed += 1
                 since_ckpt += 1
@@ -220,20 +237,44 @@ class Committer:
                 self.q.put(None, timeout=5)
             except queue.Full:
                 pass
-        if self._thread:
-            self._thread.join(timeout=30)
-            if self._thread.is_alive():
-                raise RuntimeError("committer thread did not finish in 30 s; "
-                                   f"{self.q.qsize()} frames still queued")
-        if self._proc:
-            self._proc.wait(timeout=30)
-            if self._proc.returncode != 0 or self.error:
-                # Formatted separately. Concatenating the two branches glued
-                # the exit code onto the errno text, so a broken pipe on exit
-                # 2 read "fast-import failed ([Errno 32] Broken pipe2)".
-                why = (repr(self.error) if self.error
-                       else f"exit {self._proc.returncode}")
-                raise RuntimeError(
-                    f"fast-import failed ({why}): {self._stderr_text()}")
-        if self._stderr:
-            self._stderr.close()
+        try:
+            if self._thread:
+                self._thread.join(timeout=30)
+                if self._thread.is_alive():
+                    # Kill the child before giving up on the thread. Raising
+                    # with fast-import still running leaves an orphan holding a
+                    # half-written pack open, and on Windows an open pack is an
+                    # unlinkable one: the next `carctl maintain` fails its
+                    # repack for a reason that has nothing to do with
+                    # maintenance.
+                    if self._proc:
+                        self._proc.kill()
+                    raise RuntimeError(
+                        "committer thread did not finish in 30 s; "
+                        f"{self.q.qsize()} frames still queued")
+            if self._proc:
+                try:
+                    self._proc.wait(timeout=30)
+                except subprocess.TimeoutExpired as exc:
+                    # Same orphan, reached the other way: the thread wrote
+                    # `done` and left, and fast-import is still chewing on it
+                    # (or wedged). We are leaving either way, so leave nothing
+                    # holding the pack.
+                    self._proc.kill()
+                    raise RuntimeError(
+                        "fast-import did not exit within 30 s of `done` and "
+                        f"was killed: {self._stderr_text()}") from exc
+                if self._proc.returncode != 0 or self.error:
+                    # Formatted separately. Concatenating the two branches glued
+                    # the exit code onto the errno text, so a broken pipe on exit
+                    # 2 read "fast-import failed ([Errno 32] Broken pipe2)".
+                    why = (repr(self.error) if self.error
+                           else f"exit {self._proc.returncode}")
+                    raise RuntimeError(
+                        f"fast-import failed ({why}): {self._stderr_text()}")
+        finally:
+            # The stderr file is read by _stderr_text() on the raising paths
+            # above, so it closes here rather than before them -- but it closes
+            # on every path, including those.
+            if self._stderr:
+                self._stderr.close()

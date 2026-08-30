@@ -71,7 +71,12 @@ def cmd_incident(args):
     plant = Plant()
     hit = None
     now = None
-    for _ in range(int(args.seconds / 0.1)):
+    # `f` outlives the loop, and with --seconds 0 (anything under 0.05) the
+    # body never runs at all, so the `now = f` below raised UnboundLocalError
+    # where "no incident" was the honest answer.
+    f = None
+    # round, not int, for the reason loop.py gives: int(2.9 / 0.1) is 28.
+    for _ in range(round(args.seconds / 0.1)):
         f = plant.step()
         for inc in safety.detect(f, plant.true_light()):
             if inc.kind == args.kind and hit is None:
@@ -173,13 +178,25 @@ def cmd_lineage(args):
 
 def cmd_maintain(args):
     """Retention and repack. Runs only while the vehicle is stopped."""
-    for line in retainmod.maintain(REPO, args.days, args.dry_run):
+    try:
+        report = retainmod.maintain(REPO, args.days, args.dry_run)
+    except retainmod.MaintenanceError as exc:
+        # The window is resolved inside maintain() -- flag, then
+        # $CARCTL_WINDOW_DAYS, then the default -- so a garbage env value
+        # surfaces here rather than at parse time. Exit non-zero: a
+        # maintenance pass that did not run must not look like one that found
+        # nothing to do.
+        sys.exit(f"maintain: {exc}")
+    for line in report:
         print(line)
 
 
 def cmd_bisect(args):
-    tags = _git("for-each-ref", "--format=%(refname:short)",
-                "refs/tags/drive-*").split()
+    # Numerically, via the same helper retention picks the previous drive
+    # with. `for-each-ref` sorts lexically, which puts drive-0010 before
+    # drive-0009 and hands bisect two endpoints in the wrong order once a
+    # tenth drive exists.
+    tags = [name for _, name in retainmod._drive_tags(REPO)]
     if len(tags) < 2:
         print("need at least two tagged drives"); return
     good, bad = args.good or tags[0], args.bad or tags[-1]
@@ -188,6 +205,99 @@ def cmd_bisect(args):
     print(blamemod.bisect_script(REPO, good, bad), end="")
     print()
     print("emitted, not run. bisecting a moving vehicle is not a thing.")
+    print("the script calls `carctl`, so it needs the package installed and "
+          "on PATH (pip install .); `python -m carctl` works the same way if "
+          "you would rather not.")
+    print("`--kind red_light_run` narrows the assert to one incident kind; "
+          "the bare form works too, because the obstacles are places in the "
+          "world, and a replay that stops for the light never reaches them.")
+
+
+class ReplayError(Exception):
+    """The checkout does not describe a frame we can replay."""
+
+
+def _frame_input(directory: str, name: str):
+    """One of the checked-out frame's files, as JSON.
+
+    Read from the working directory, never from REPO. `git bisect run` runs
+    its command in a checkout of the commit under test, and the frame being
+    replayed is the one in that tree; REPO is wherever this package happens to
+    be installed and its main is at whatever tip the last drive left.
+    """
+    path = os.path.join(directory, name)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ReplayError(f"{name}: {exc}") from exc
+
+
+def cmd_replay(args):
+    """Re-drive up to the checked-out frame with its checkpoint set pinned.
+
+    The question this answers is the one bisect is asking: would this drive
+    have gone wrong under the models that were loaded HERE? So the checked-out
+    models.json is held in force for the whole replay rather than swapped
+    mid-drive by the OTA script -- otherwise every replay ends up running the
+    promoted checkpoint and every commit in the range answers the same way,
+    which is a bisect with no signal in it.
+
+    Deterministic, so the seq in state.json is enough to say how far to run:
+    the plant is a fixed script and the frame at tick n is the frame at tick n.
+    """
+    directory = os.path.abspath(args.dir)
+    try:
+        state = _frame_input(directory, "state.json")
+        seq = state.get("seq") if isinstance(state, dict) else None
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            raise ReplayError("state.json carries no usable seq")
+        checkpoints = _frame_input(directory, "models.json")
+        if (not isinstance(checkpoints, dict) or not checkpoints
+                or not all(isinstance(v, str) for v in checkpoints.values())):
+            raise ReplayError("models.json is not a checkpoint set")
+    except ReplayError as exc:
+        print(f"replay: {exc}", file=sys.stderr)
+        print(f"replay: reads a frame checkout, and {directory} is not one. "
+              "git bisect leaves one in the working directory; --dir points "
+              "somewhere else.", file=sys.stderr)
+        # Not 125. To `git bisect run` that means "skip this commit", and a
+        # frame we cannot read is a broken invocation, not an untestable
+        # commit: skipping every commit in the range would end in a confident
+        # bisect result drawn from nothing.
+        sys.exit(2)
+
+    plant = Plant(checkpoints)
+    found = []
+    for _ in range(seq + 1):
+        f = plant.step()
+        # Nothing past the frame under test counts. The loop bound already
+        # says that, and the filter is what keeps it true of the answer rather
+        # than of the loop: a bisect step must judge the commit it was handed,
+        # not the crash that came four seconds after it.
+        found += [i for i in safety.detect(f, plant.true_light())
+                  if i.seq <= seq and args.kind in ("", i.kind)]
+    what = args.kind or "incident"
+
+    print(f"replaying seq 0..{seq} with the checked-out checkpoint set held "
+          "in force:")
+    for k, v in sorted(checkpoints.items()):
+        print(f"  {k:12s} {v}")
+    if not found:
+        print(f"clean: no {what} through seq {seq}")
+        return
+    kinds = {}
+    for i in found:
+        kinds.setdefault(i.kind, []).append(i)
+    across = "" if args.kind else f" across {len(kinds)} kind(s)"
+    print(f"{len(found)} {what} tick(s){across}:")
+    for k, v in kinds.items():
+        print(f"  {k:15s} first at seq {v[0].seq:4d}  {v[0].detail}")
+        print(f"  {'':15s} owner: {v[0].subsystem}")
+    if args.assert_no_incident:
+        # 1, not 2 and not 125: `git bisect run` reads 1..124 as "bad", 125 as
+        # "skip", and anything above 127 aborts the bisect outright.
+        sys.exit(1)
 
 
 def cmd_publish(args):
@@ -224,7 +334,15 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="carctl")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    d = sub.add_parser("drive"); d.add_argument("--seconds", type=float, default=14.0)
+    d = sub.add_parser("drive")
+    # 17, not 14. The scripted stop is at t=14.0, so a 14 s drive ends with
+    # the car still rolling at ~9 km/h and retain.stationary(), which reads
+    # the last committed frame's speed, can never pass after a default drive.
+    # By 17 s it has settled to ~0.4 km/h.
+    d.add_argument("--seconds", type=float, default=17.0,
+                   help="drive length; the default runs past the scripted "
+                        "stop so the vehicle is stationary at the end, which "
+                        "is what `carctl maintain` requires")
     d.add_argument("--fast", action="store_true",
                    help="skip real-time pacing (CI / replay)")
     d.set_defaults(func=cmd_drive)
@@ -241,6 +359,27 @@ def main(argv=None):
     b.add_argument("--good"); b.add_argument("--bad")
     b.set_defaults(func=cmd_bisect)
 
+    rp = sub.add_parser(
+        "replay",
+        help="re-drive up to the checked-out frame with its checkpoint set "
+             "pinned; the test `carctl bisect` emits")
+    rp.add_argument("--assert-no-incident", action="store_true",
+                    help="exit 1 if the replay hits one, 0 if it is clean; "
+                         "what `git bisect run` reads")
+    # Validated against the kinds that exist, rather than taken as free text.
+    # A typo would otherwise match nothing, report every frame clean, and hand
+    # `git bisect run` a confident answer built out of a misspelling.
+    rp.add_argument("--kind", default="", choices=sorted(safety.OWNER),
+                    help="judge this incident kind only; red_light_run is "
+                         "the one the checkpoint set decides, while collision "
+                         "and curb_strike are scripted into the world and "
+                         "fire either way")
+    rp.add_argument("--dir", default=".",
+                    help="the frame checkout to read state.json and "
+                         "models.json from (default: the working directory, "
+                         "which is where git bisect leaves them)")
+    rp.set_defaults(func=cmd_replay)
+
     ln = sub.add_parser("lineage")
     ln.add_argument("-n", type=int, default=20)
     ln.add_argument("--backfill", action="store_true",
@@ -251,8 +390,15 @@ def main(argv=None):
     ln.set_defaults(func=cmd_lineage)
 
     m = sub.add_parser("maintain")
-    m.add_argument("--days", type=float, default=retainmod.MAIN_WINDOW_DAYS,
-                   help="how much full-frame history main keeps")
+    # Defaulted in retain.maintain(), not here, because the fallback is a
+    # chain rather than a value: the flag wins, then $CARCTL_WINDOW_DAYS, then
+    # MAIN_WINDOW_DAYS. Filling the constant in here would make every
+    # invocation look like an explicit --days and the env var would never be
+    # consulted.
+    m.add_argument("--days", type=float, default=None,
+                   help="how much full-frame history main keeps, in days; "
+                        f"default $CARCTL_WINDOW_DAYS, else "
+                        f"{retainmod.MAIN_WINDOW_DAYS:g}")
     m.add_argument("--dry-run", action="store_true",
                    help="say what would be dropped, change nothing")
     m.set_defaults(func=cmd_maintain)

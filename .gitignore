@@ -1,2 +1,10 @@
 .control/
 __pycache__/
+.claude_trash/
+.venv/
+.idea/
+.vscode/
+.DS_Store
+*.egg-info/
+build/
+dist/
