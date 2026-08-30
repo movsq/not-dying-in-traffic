@@ -10,9 +10,15 @@ plain form POST is a CORS simple request, so nothing preflights it and nothing
 blocks it. Halting a vehicle from a random web page is not a feature. Every
 mutating request needs a same-origin Host, an Origin that is either absent or
 ours, and a token minted at startup and only ever handed to the served page.
+
+Reads are guarded too, on the Host alone. That check used to sit only on the
+write path, which left the two routes that matter most wide open: `GET /` is
+what hands out the token, and `/events` is the live 10 Hz position feed. A
+page that rebinds DNS to 127.0.0.1 could read both, so the guard that was
+described as blocking DNS rebinding was not on the requests being rebound.
 """
 from __future__ import annotations
-import json, os, queue, secrets, threading, time, http.server, socketserver
+import json, os, queue, secrets, threading, time, http.server
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from carctl.plant import Plant
@@ -26,6 +32,9 @@ TOKEN = secrets.token_urlsafe(16)
 subscribers: list[queue.Queue] = []
 subs_lock = threading.Lock()
 STATE = {"halted": False, "last_good_seq": 0}
+
+HEARTBEAT_S = 5.0          # idle gap before the stream proves it is still alive
+_STOP = object()           # sentinel: this subscriber has been dropped
 
 
 def _broadcast(payload: dict) -> None:
@@ -42,6 +51,22 @@ def _broadcast(payload: dict) -> None:
             for q in dead:
                 if q in subscribers:
                     subscribers.remove(q)
+        for q in dead:
+            # Wake the handler so it closes the socket and the browser's
+            # EventSource reconnects. Dropping the queue and walking away left
+            # that thread parked in get() forever with the socket still open,
+            # so the page froze on a stale frame while continuing to display
+            # "streaming @ 10 Hz" -- stale state shown as live, on a safety
+            # display. Make room first: the queue is full, that is why we are
+            # here.
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(_STOP)
+            except queue.Full:
+                pass
 
 
 def _drive_forever() -> None:
@@ -81,25 +106,53 @@ def _drive_forever() -> None:
             time.sleep(0.1)
 
 
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, directory=HERE, **kw)
+class Handler(http.server.BaseHTTPRequestHandler):
+    # Deliberately not SimpleHTTPRequestHandler. Inheriting a static file
+    # server meant every path this class did not claim was served off disk
+    # from the dashboard directory; the two routes below are the whole API.
 
     def log_message(self, *a):  # keep the console clean
         pass
 
     # ---- guards ------------------------------------------------------------
-    def _authorised(self) -> str | None:
-        """Return a refusal reason, or None if the request may proceed."""
+    def _host_ok(self) -> str | None:
+        """Host check. Applied to EVERY route, reads included.
+
+        This used to live only inside _authorised(), which only do_POST
+        called, so the line commented "blocks DNS rebinding" blocked nothing
+        on a GET -- and GET / is the route that hands out the token.
+        """
         host = (self.headers.get("Host") or "").strip()
         if host not in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
-            return f"unexpected Host {host!r}"      # blocks DNS rebinding
+            return f"unexpected Host {host!r}"
+        return None
+
+    def _route(self) -> str:
+        """The request path, without query or fragment, lowercased.
+
+        Matching self.path exactly sent `/?v=2` and `/INDEX.HTML` to the
+        static handler, which served index.html carrying the literal
+        __REVERT_TOKEN__ -- a page that streams telemetry and looks perfectly
+        healthy while every halt it sends is refused forever.
+        """
+        path = self.path.split("#", 1)[0].split("?", 1)[0]
+        return path.rstrip("/").lower() or "/"
+
+    def _authorised(self) -> str | None:
+        """Return a refusal reason, or None if the request may proceed."""
+        why = self._host_ok()
+        if why:
+            return why
         origin = self.headers.get("Origin")
         if origin and origin not in (f"http://127.0.0.1:{PORT}",
                                      f"http://localhost:{PORT}"):
             return f"cross-origin request from {origin!r}"
         token = self.headers.get("X-Revert-Token")
-        if not token or not secrets.compare_digest(token, TOKEN):
+        # Headers are latin-1 decoded and compare_digest raises TypeError on a
+        # non-ASCII str, which escaped the handler and closed the connection
+        # with no response at all. A non-ASCII token is simply a wrong token.
+        if (not token or not token.isascii()
+                or not secrets.compare_digest(token, TOKEN)):
             return "missing or bad X-Revert-Token"
         return None
 
@@ -117,7 +170,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # ---- reads -------------------------------------------------------------
     def do_GET(self):
-        if self.path == "/events":
+        why = self._host_ok()
+        if why:
+            self._deny(why); return
+        route = self._route()
+        if route == "/events":
             q: queue.Queue = queue.Queue(maxsize=20)
             with subs_lock:
                 subscribers.append(q)
@@ -127,7 +184,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             try:
                 while True:
-                    data = q.get()
+                    try:
+                        data = q.get(timeout=HEARTBEAT_S)
+                    except queue.Empty:
+                        # An SSE comment. Proves the socket is still there,
+                        # and lets a peer that went away surface as an OSError
+                        # instead of parking this thread in get() forever.
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    if data is _STOP:
+                        break      # dropped by _broadcast; let the page reconnect
                     self.wfile.write(b"data: " +
                                      json.dumps(data).encode() + b"\n\n")
                     self.wfile.flush()
@@ -138,7 +205,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     if q in subscribers:
                         subscribers.remove(q)
             return
-        if self.path in ("/", "", "/index.html"):
+        if route in ("/", "/index.html"):
             # The token reaches the page and nowhere else. Requiring it as a
             # custom header also forces a CORS preflight on any cross-origin
             # attempt, which we never answer.
@@ -150,17 +217,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        return super().do_GET()
+        # No fallthrough to a static file handler. Serving the dashboard
+        # directory meant GET /server.py returned this file verbatim, guards
+        # and all, to anyone who asked.
+        self.send_error(404)
 
     # ---- writes ------------------------------------------------------------
     def do_POST(self):
-        if self.path not in ("/revert-hard", "/resume"):
+        route = self._route()
+        if route not in ("/revert-hard", "/resume"):
             self.send_error(404); return
         why = self._authorised()
         if why:
             self._deny(why); return
 
-        if self.path == "/resume":
+        if route == "/resume":
             STATE["halted"] = False
             _broadcast({"resumed": True})
             self._json({"ok": True, "action": "resumed"})
@@ -187,7 +258,15 @@ if __name__ == "__main__":
     # bind a port another process is already serving, and requests go to
     # whichever the kernel picks. Launching twice then leaves a stale server
     # answering, with whatever guards the old code had. Fail the second bind.
-    socketserver.ThreadingTCPServer.allow_reuse_address = (os.name != "nt")
-    with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
+    class _Server(http.server.ThreadingHTTPServer):
+        # ThreadingHTTPServer, not ThreadingTCPServer: the latter leaves
+        # daemon_threads False and block_on_close True, so server_close()
+        # joins every handler thread. One SSE stream parked in q.get() then
+        # wedged the process on Ctrl-C while still holding the port -- and
+        # with reuse off, the relaunch below fails rather than shadowing it,
+        # so the operator was left with no dashboard until they killed a PID.
+        allow_reuse_address = (os.name != "nt")
+
+    with _Server(("127.0.0.1", PORT), Handler) as httpd:
         print(f"dashboard on http://127.0.0.1:{PORT}")
         httpd.serve_forever()

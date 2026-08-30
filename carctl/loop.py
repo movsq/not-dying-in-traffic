@@ -60,40 +60,61 @@ def drive(repo: str, seconds: float, realtime: bool = True,
 
     latched: set[str] = set()
     epoch = time.monotonic()
-    n_ticks = int(seconds / DT)
+    # round, not int. `int(2.9 / 0.1)` is 28, because 2.9/0.1 is
+    # 28.999999999999996 in binary -- 196 of the first 600 tenth-second
+    # durations lost their last tick, silently, from a loop whose stated
+    # product is that a frame exists for every 100 ms of the drive.
+    n_ticks = round(seconds / DT)
 
-    for i in range(n_ticks):
-        deadline = epoch + i * DT
-        if realtime:
-            slack = deadline - time.monotonic()
-            if slack > 0:
-                time.sleep(slack)
-            else:
-                rep.overruns += 1
-            jitter = (time.monotonic() - deadline) * 1000
-            rep.max_jitter_ms = max(rep.max_jitter_ms, jitter)
+    try:
+        for i in range(n_ticks):
+            # Tick i is due one full period after the epoch, not at it.
+            # `epoch + i * DT` made tick 0 due at the instant epoch was
+            # sampled, so slack was always microseconds negative and every
+            # drive reported a deadline overrun that never happened -- while
+            # a real first-tick overrun stayed invisible underneath it. It
+            # also ended the drive a tick early: --seconds 14 paced 13.9 s.
+            deadline = epoch + (i + 1) * DT
+            if realtime:
+                slack = deadline - time.monotonic()
+                if slack > 0:
+                    time.sleep(slack)
+                else:
+                    rep.overruns += 1
+                jitter = (time.monotonic() - deadline) * 1000
+                rep.max_jitter_ms = max(rep.max_jitter_ms, jitter)
 
-        frame = plant.step()
+            frame = plant.step()
 
-        # Safety runs before the commit. The record must never be the thing
-        # standing between a hazard and the brakes.
-        inc = safety.detect(frame, plant.true_light())
-        if inc and inc.kind in latched:
-            inc = None                      # same event, still unfolding
-        elif inc:
-            latched.add(inc.kind)
-            rep.incidents.append(inc)
+            # Safety runs before the commit. The record must never be the
+            # thing standing between a hazard and the brakes.
+            inc = safety.detect(frame, plant.true_light())
+            if inc and inc.kind in latched:
+                inc = None                  # same event, still unfolding
+            elif inc:
+                latched.add(inc.kind)
+                rep.incidents.append(inc)
 
-        t0 = time.perf_counter()
-        committer.submit(frame)
-        rep.max_submit_us = max(rep.max_submit_us,
-                                (time.perf_counter() - t0) * 1e6)
-        rep.ticks += 1
-        if on_frame:
-            on_frame(frame, inc)
-
-    committer.stop()
+            t0 = time.perf_counter()
+            committer.submit(frame)
+            rep.max_submit_us = max(rep.max_submit_us,
+                                    (time.perf_counter() - t0) * 1e6)
+            rep.ticks += 1
+            if on_frame:
+                on_frame(frame, inc)
+    finally:
+        # stop() has to run even on Ctrl-C, or on a raising on_frame -- cli.py
+        # passes a closure. Skipping it left the daemon drain thread to die at
+        # interpreter exit with `done` never written: fast-import then exits
+        # "stream ends early" and every frame since the last checkpoint, up to
+        # CHECKPOINT_EVERY and so 4.9 s of driving, is gone from the record.
+        try:
+            committer.stop()
+        finally:
+            # Recorded even if stop() raises. A drive that committed 140
+            # frames and then failed to shut down cleanly should still be able
+            # to tell you it committed 140 frames.
+            rep.dropped = committer.dropped
+            rep.committed = committer.committed
     rep.tag = _tag_drive(repo)
-    rep.dropped = committer.dropped
-    rep.committed = committer.committed
     return rep

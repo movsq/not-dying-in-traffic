@@ -106,14 +106,43 @@ def reachable(now: Frame, goal: dict) -> RevertVerdict:
                          goal=goal, cost_m=dist)
 
 
+def _state_at(repo: str, rev: str) -> tuple[dict | None, str]:
+    """Read one commit's state.json. Returns (state, error). A malformed blob
+    used to raise straight out of the gate, and an exception escaping a safety
+    check is not a refusal -- it is an unhandled crash where a `no` belonged.
+    """
+    r = subprocess.run(["git", "show", f"{rev}:state.json"], cwd=repo,
+                       capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        return None, f"cannot read state.json at {rev}"
+    try:
+        d = json.loads(r.stdout)
+    except ValueError as exc:
+        return None, f"state.json at {rev} is not JSON: {exc}"
+    if not isinstance(d, dict) or "pose" not in d:
+        return None, f"state.json at {rev} has no pose"
+    return d, ""
+
+
 def physical_revert(repo: str, sha: str, now: Frame) -> RevertVerdict:
     """Evaluate reverting `sha` physically. Does not touch the repo."""
-    parent_state = subprocess.run(
-        ["git", "show", f"{sha}^:state.json"], cwd=repo,
-        capture_output=True, text=True, encoding="utf-8")
-    if parent_state.returncode != 0:
+    # The one-way door is recorded on the frame being reverted, not on the
+    # frame we would return to. Reading only the parent asked "was the world
+    # reversible one tick BEFORE the curb strike?", which is true right up
+    # until the instant it stops being the question -- so `reversible: false`
+    # never once blocked the revert of the very frame that set it, and the
+    # `!` marker msgen derives from it was decorative here.
+    frame, err = _state_at(repo, sha)
+    if err:
+        return RevertVerdict(False, err)
+    if not frame.get("reversible", True):
+        return RevertVerdict(
+            False, f"frame {frame.get('seq', '?')} is itself marked "
+            "irreversible; the world cannot be walked back through it")
+    goal, err = _state_at(repo, f"{sha}^")
+    if err:
         return RevertVerdict(False, "no parent commit to revert to")
-    return reachable(now, json.loads(parent_state.stdout))
+    return reachable(now, goal)
 
 
 @dataclass
@@ -151,11 +180,21 @@ def record_revert(repo: str, sha: str, worktree_root: str,
                             already=True)
 
     wt = os.path.join(worktree_root, full[:12])
+    if os.path.exists(wt):
+        # Debris from a crashed or un-removable earlier attempt. `-f` below
+        # overrides the branch-already-checked-out check, NOT an existing
+        # path, so without this every later revert of this sha collides with
+        # the leftover and fails forever.
+        subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=repo,
+                       capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=repo,
+                       capture_output=True)
     add = subprocess.run(["git", "worktree", "add", "--detach", "-f", wt, full],
                          cwd=repo, capture_output=True, text=True,
                          encoding="utf-8")
     if add.returncode != 0:
         return RecordRevert(False, detail=f"worktree: {add.stderr.strip()[:300]}")
+    keep = False
     try:
         rv = subprocess.run(["git", "revert", "--no-edit", "-n", full], cwd=wt,
                             capture_output=True, text=True, encoding="utf-8")
@@ -170,14 +209,42 @@ def record_revert(repo: str, sha: str, worktree_root: str,
             return RecordRevert(
                 False, detail=f"commit: {(cm.stderr or cm.stdout).strip()[:300]}")
         new = _rev(wt, "HEAD")
-        subprocess.run(["git", "update-ref", ref, new], cwd=repo,
-                       capture_output=True)
+        if not new:
+            return RecordRevert(
+                False, detail="revert was committed but HEAD does not resolve")
+        anchor = subprocess.run(["git", "update-ref", ref, new], cwd=repo,
+                                capture_output=True, text=True,
+                                encoding="utf-8")
+        if anchor.returncode != 0:
+            # This was the one unchecked exit code left, and it was the one
+            # that mattered: the ref is the ONLY thing referencing `new`, so
+            # the removal below would have left the revert commit unreachable
+            # and gc-able while we returned ok=True. Keep the worktree -- it
+            # is now the sole reference -- and say so.
+            keep = True
+            return RecordRevert(
+                False, new,
+                f"revert commit {new[:12]} was made but could not be anchored "
+                f"at {ref}: {anchor.stderr.strip()[:200]}. Keeping the "
+                f"worktree at {wt}, which is the only thing referencing it.")
         return RecordRevert(True, new, f"recorded at {ref}")
     finally:
-        # The checkout is a regenerable artifact; the commit it produced is
-        # already anchored by the ref above.
-        subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=repo,
-                       capture_output=True)
+        # The checkout is a regenerable artifact ONLY once the commit it
+        # produced is anchored by the ref above; `keep` is what tells the two
+        # cases apart.
+        if not keep:
+            rm = subprocess.run(["git", "worktree", "remove", "--force", wt],
+                                cwd=repo, capture_output=True, text=True,
+                                encoding="utf-8")
+            if rm.returncode != 0:
+                # A file held open (AV scanners do this on Windows) leaves
+                # both the directory and its admin entry behind, and
+                # `worktree add -f` does not overwrite an existing path -- so
+                # every future revert of this sha would fail. Prune the admin
+                # entry so the next attempt can at least diagnose the
+                # leftover directory instead of colliding with a stale one.
+                subprocess.run(["git", "worktree", "prune"], cwd=repo,
+                               capture_output=True)
 
 
 def _subject(repo: str, sha: str) -> str:

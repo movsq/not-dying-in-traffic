@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, subprocess, sys
+import argparse, json, os, re, subprocess, sys
 from . import blame as blamemod, loop as loopmod, publish as pubmod, safety, stash as stashmod
 from .plant import Plant
 from .stash import Preconditions
@@ -9,6 +9,34 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _git(*a):
     return subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True, encoding="utf-8").stdout
+
+
+def _commit_for_seq(seq: int) -> tuple[str, str]:
+    """Resolve a frame's seq to its commit in the most recent drive.
+
+    Returns (sha, error). Indexing `git log --max-count=<seconds/0.1>`
+    positionally assumed every drive was exactly as long as the flag passed to
+    THIS command. Real drive lengths on this repo run 280, 140, 60, 30, so the
+    index landed inside a previous drive -- and that wrong sha was then
+    blamed, and record-reverted, against a frame that had no incident. The
+    Seq: trailer is already in every message; read it.
+    """
+    out = _git("log", "--format=%H%x1f%B%x1e", "refs/heads/main")
+    for entry in out.split("\x1e"):
+        sha, _, body = entry.strip().partition("\x1f")
+        m = re.search(r"^Seq: (\d+)$", body, re.M)
+        if not m:
+            continue
+        found = int(m.group(1))
+        if found == seq:
+            return sha.strip(), ""
+        if found < seq:
+            # Walking back from the tip, seq descends within a drive. Dropping
+            # below the target without matching means this drive ended before
+            # that frame, so it is not the drive we are looking at.
+            break
+    return "", (f"seq {seq} is not in the most recent drive on "
+                f"refs/heads/main; run a drive at least {seq + 1} frames long")
 
 
 def cmd_drive(args):
@@ -53,16 +81,9 @@ def cmd_incident(args):
     if not hit:
         print(f"no {args.kind} in this drive"); return
     frame, inc = hit
-    # frame.seq counts within one drive, so it can only index that drive's
-    # commits. Indexing the repo-wide log sent every incident to a commit from
-    # the first drive once a second drive existed.
-    n_frames = int(args.seconds / 0.1)
-    log = _git("log", "--format=%H", f"--max-count={n_frames}",
-               "--reverse", "refs/heads/main").splitlines()
-    if frame.seq >= len(log):
-        print(f"seq {frame.seq} is outside the last {len(log)} commits; "
-              "run a drive first"); return
-    csha = log[frame.seq]
+    csha, err = _commit_for_seq(frame.seq)
+    if err:
+        print(err); return
 
     print(f"INCIDENT  {inc.kind}  seq {inc.seq}  commit {csha[:10]}")
     print(f"  {inc.detail}")
