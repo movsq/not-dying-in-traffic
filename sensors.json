@@ -3,10 +3,10 @@
  "lane_ref": "",
  "lateral_offset": 0.0,
  "lidar_min_bearing": -0.4,
- "lidar_min_range": 6.1,
- "lidar_min_range_rear": 1.1,
+ "lidar_min_range": 5.7,
+ "lidar_min_range_rear": 0.8,
  "light_distance": -25.0,
  "light_state": "red",
  "stop_line_crossed": false,
- "wheel_slip": 0.11
+ "wheel_slip": 0.02
 }
