@@ -3,12 +3,12 @@
  "pose": {
   "heading": 0.9,
   "steer": -0.0,
-  "v": 0.4,
+  "v": 0.3,
   "x": 50.0,
   "y": 100.0
  },
  "reversible": false,
  "road": "Je\u010dn\u00e1",
- "seq": 157,
+ "seq": 158,
  "t_mono_ns": 0
 }
