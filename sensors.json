@@ -1,6 +1,6 @@
 {
  "imu_accel_z": 9.8,
- "lane_ref": "Vinohradsk\u00e1:0>Je\u010dn\u00e1:0",
+ "lane_ref": "Je\u010dn\u00e1:0",
  "lateral_offset": 0.3,
  "lidar_min_bearing": 0.0,
  "lidar_min_range": 40.0,
