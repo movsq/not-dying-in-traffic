@@ -56,6 +56,10 @@ LOCK_NAME = "carctl-drive.lock"
 # mid-drive must not leave a file behind that blocks maintenance forever on a
 # vehicle with nobody in it.
 LOCK_GRACE_S = 60.0
+# `git repack --geometric` landed in 2.32. Everything else here works on the
+# git that ships with a 2020 distribution, so this is the one version gate,
+# and it degrades rather than refusing.
+MIN_GEOMETRIC_GIT = (2, 32)
 
 
 class MaintenanceError(Exception):
@@ -168,6 +172,19 @@ def _drive_tags(repo: str) -> list[tuple[int, str]]:
 
 def _is_ancestor(repo: str, a: str, b: str) -> bool:
     return _git(repo, "merge-base", "--is-ancestor", a, b).returncode == 0
+
+
+def git_version(repo: str) -> tuple[int, ...]:
+    """(major, minor) of the git on PATH, or () if it will not say."""
+    parts = _out(repo, "version").split()
+    if len(parts) < 3:
+        return ()
+    out = []
+    for field in parts[2].split("."):
+        if not field.isdigit():
+            break
+        out.append(int(field))
+    return tuple(out)
 
 
 def _is_shallow(repo: str) -> bool:
@@ -421,7 +438,7 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
     # The one place a full repack is right: it is what actually drops the
     # objects, and it runs at most once per window rather than after every
     # drive.
-    _out(repo, "repack", "-a", "-d", "--unpack-unreachable=now", "--write-midx")
+    _out(repo, "repack", "-a", "-d", "--unpack-unreachable=now")
     _out(repo, "prune", "--expire=now")
     report.append(f"pack {before} -> {_disk(repo)}")
     return report, True
@@ -436,12 +453,21 @@ def repack(repo: str, dry_run: bool = False) -> list[str]:
     small packs, which is what makes this affordable often enough to matter.
     """
     n = len(_packs(repo))
+    geometric = git_version(repo) >= MIN_GEOMETRIC_GIT
+    how = "geometrically" if geometric else "in full, git is older than 2.32"
     if dry_run:
-        return [f"{n} pack(s), {_disk(repo)}; would repack geometrically"]
+        return [f"{n} pack(s), {_disk(repo)}; would repack {how}"]
     before = _disk(repo)
-    _out(repo, "repack", "-d", "--geometric=2", "--write-midx")
+    if geometric:
+        _out(repo, "repack", "-d", "--geometric=2")
+    else:
+        # No --geometric means no cheap way to collapse the per-session packs,
+        # so take the expensive one. More work than it needs to be, which is
+        # the right way round for the half of this that is only about lookup
+        # cost. The multi-pack-index is written by maintain() either way.
+        _out(repo, "repack", "-a", "-d")
     return [f"{n} pack(s) {before} -> {len(_packs(repo))} pack(s) "
-            f"{_disk(repo)}"]
+            f"{_disk(repo)} ({how})"]
 
 
 def _packs(repo: str) -> list[str]:
