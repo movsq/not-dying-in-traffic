@@ -183,6 +183,13 @@ control, and a plain form POST from any other page in the same browser is a
 CORS simple request that nothing preflights. Halting a vehicle should take more
 than an open tab.
 
+One thing that bit me while testing the guard: `allow_reuse_address` means
+something different on Windows. A second process can bind a port another is
+already serving, so relaunching the dashboard left the old build answering
+requests with the old build's guards, and my test passed against a server that
+did not have the fix in it. The flag is now off on Windows, and a second launch
+fails with WinError 10048 instead of quietly shadowing the first.
+
 The confirmation dialog says what you asked for, and under it, the two numbers
 that disagree.
 

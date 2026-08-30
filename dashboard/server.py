@@ -183,7 +183,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=_drive_forever, daemon=True).start()
-    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    # SO_REUSEADDR means something different on Windows: a second process can
+    # bind a port another process is already serving, and requests go to
+    # whichever the kernel picks. Launching twice then leaves a stale server
+    # answering, with whatever guards the old code had. Fail the second bind.
+    socketserver.ThreadingTCPServer.allow_reuse_address = (os.name != "nt")
     with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"dashboard on http://127.0.0.1:{PORT}")
         httpd.serve_forever()
