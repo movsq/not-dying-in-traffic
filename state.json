@@ -1,14 +1,14 @@
 {
- "maneuver": "brake",
+ "maneuver": "park",
  "pose": {
   "heading": 1.6,
-  "steer": -0.0,
-  "v": 6.2,
+  "steer": -0.1,
+  "v": 5.7,
   "x": 50.0,
   "y": 75.0
  },
  "reversible": true,
  "road": "Je\u010dn\u00e1",
- "seq": 124,
+ "seq": 125,
  "t_mono_ns": 0
 }
