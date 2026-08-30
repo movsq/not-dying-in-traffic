@@ -3,12 +3,12 @@
  "pose": {
   "heading": 0.0,
   "steer": 0.0,
-  "v": 10.0,
+  "v": 9.6,
   "x": 25.0,
   "y": 0.0
  },
  "reversible": true,
  "road": "Vinohradsk\u00e1",
- "seq": 21,
+ "seq": 22,
  "t_mono_ns": 0
 }
