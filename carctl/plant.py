@@ -2,9 +2,11 @@
 from __future__ import annotations
 import math, time
 from .state import Pose, Sensors, Actuators, Frame
+from . import safety
 
 WHEELBASE = 2.7  # m
 DT = 0.1         # s, one tick, one commit
+DT_NS = 100_000_000   # the same tick as an exact integer of nanoseconds
 
 # The scripted drive. (t_start, road, maneuver, steer_cmd, target_speed)
 SCRIPT = [
@@ -130,17 +132,30 @@ class Plant:
 
         # Reversibility is decided here, at capture time, not at revert time.
         # Anything that dissipated energy into the world is a one-way door.
-        reversible = (curb == 0.0 and lidar > 2.0
+        # Read from the same constants msgen names the reason with: testing
+        # `curb == 0.0` here against `imu_accel_z > 20` there disagreed for
+        # every impulse in 0 < curb <= 10.19, which committed a frame as
+        # irreversible with the reason "unknown", and the float equality made
+        # any filtered or noisy accel reading irreversible outright.
+        reversible = (sensors.imu_accel_z <= safety.CURB_ACCEL_Z
+                      and lidar > safety.IRREVERSIBLE_CLEARANCE
                       and not sensors.stop_line_crossed)
 
         frame = Frame(
             seq=self.seq,
-            t_mono_ns=int(self.t * 1e9),
+            t_mono_ns=self.seq * DT_NS,
             t_wall_s=int(time.time()),
             pose=self.pose, sensors=sensors, actuators=actuators,
             road=road, maneuver=maneuver, reversible=reversible,
             checkpoints=self.checkpoints,
         )
         self.seq += 1
-        self.t += DT
+        # Derived from the tick count, never accumulated. `self.t += DT`
+        # drifts low, because 0.1 is not representable in binary: at nominal
+        # tick 60 t was 5.999999999999995, so every scripted threshold fired
+        # one tick late (the OTA swap at 61, the light at 103, the park at
+        # 126) and t_mono_ns came out 13899999999 where seq 139 should be
+        # 13900000000 -- in the clock state.py calls the only one control
+        # logic trusts.
+        self.t = self.seq * DT
         return frame

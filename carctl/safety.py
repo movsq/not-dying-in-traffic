@@ -26,6 +26,21 @@ MAX_LAT_OFFSET = 1.75   # m from lane centre before we call it off-road
 MIN_CLEARANCE  = 1.5    # m
 CURB_ACCEL_Z   = 20.0   # m/s^2
 
+# One definition of a one-way door, imported by plant.py (which decides the
+# flag at capture time) and msgen.py (which names the reason). These lived as
+# three separate literals that disagreed: plant tested `curb == 0.0` against a
+# 9.81 gravity offset while msgen tested imu_accel_z > 20, so any curb impulse
+# in 0 < curb <= 10.19 marked a frame irreversible with the reason "unknown".
+IRREVERSIBLE_CLEARANCE = 2.0   # m; closer than this and the frame is one-way
+
+# A parallel park legitimately closes on the car behind. plant.py's own
+# comment calls that van "what the parking manoeuvre is squeezing in behind",
+# and MIN_CLEARANCE flagged the successful park as a collision.
+PARK_CLEARANCE = 0.5    # m; the floor even a parking manoeuvre must not cross
+
+LIDAR_MAX_RANGE  = 40.0   # m; a return at exactly max range means "nothing seen"
+PATH_BEARING_TOL = 0.35   # rad; a return outside this cone is not on our path
+
 # Which subsystem owns which failure. This mapping is what turns `git blame`
 # from a party trick into an incident tool.
 OWNER = {
@@ -62,7 +77,13 @@ def detect(f: Frame, true_light: str) -> list[Incident]:
     if f.sensors.imu_accel_z > CURB_ACCEL_Z:
         found.append(Incident("curb_strike", f.seq,
                               f"az={f.sensors.imu_accel_z:.1f} m/s^2"))
-    if f.sensors.lidar_min_range < MIN_CLEARANCE:
+    # Parking gets a tighter floor, not an exemption. A bare static threshold
+    # reported the successful park at seq 139 (1.40 m from the parked van at
+    # 2.6 m/s) as a collision and blamed prediction for a manoeuvre that went
+    # right; in the shipped drive that was invisible only because curb_strike
+    # happened to outrank it.
+    limit = PARK_CLEARANCE if f.maneuver == "park" else MIN_CLEARANCE
+    if f.sensors.lidar_min_range < limit:
         found.append(Incident("collision", f.seq,
                               f"clearance={f.sensors.lidar_min_range:.2f} m"))
     if true_light == "red" and f.sensors.stop_line_crossed and f.pose.v > 1.0:
@@ -86,6 +107,20 @@ class RevertVerdict:
     cost_m: float = 0.0
 
 
+def _arc_length(dist: float, bearing: float, behind: bool) -> float:
+    """Chord to driven arc.
+
+    A car cannot translate sideways, so reaching a goal offset from straight
+    ahead (or straight behind) means driving a curve, and the straight line
+    understates it. Reverting seq 55 back to seq 25 across the scripted left
+    turn is 16.12 m of chord against 18.42 m of path, so the clearance test
+    was asking for 2.3 m less room than the manoeuvre actually needs.
+    """
+    off = (math.pi - abs(bearing)) if behind else abs(bearing)
+    off = min(off, math.pi / 2 - 1e-3)
+    return dist if off < 1e-6 else dist * off / math.sin(off)
+
+
 def reachable(now: Frame, goal: dict) -> RevertVerdict:
     """Is the parent commit's pose still inside our reachable set?"""
     gp = goal["pose"]
@@ -107,15 +142,32 @@ def reachable(now: Frame, goal: dict) -> RevertVerdict:
             "reversing is inadmissible above 7 km/h", cost_m=dist)
     # The forward cone says nothing about a path behind the car. Picking the
     # wrong sensor here refuses clear reverses and, worse, clears occupied ones.
-    ahead_or_behind = ("rear" if behind else "forward")
+    side = "rear" if behind else "forward"
     clearance = (now.sensors.lidar_min_range_rear if behind
                  else now.sensors.lidar_min_range)
-    if clearance < dist + MIN_CLEARANCE:
-        return RevertVerdict(False,
-            f"{ahead_or_behind} return path is occupied at {clearance:.1f} m",
-            cost_m=dist)
-    return RevertVerdict(True, f"reachable, {dist:.1f} m of return path",
-                         goal=goal, cost_m=dist)
+    path_len = _arc_length(dist, bearing, behind)
+    need = path_len + MIN_CLEARANCE
+
+    # A scalar min-range says nothing about WHERE the return is.
+    # lidar_min_bearing was written every frame and read by nothing, so an
+    # obstacle 0.4 rad off the path refused a clear return. The rear channel
+    # carries no bearing, so it counts as on-path, which is the conservative
+    # reading of not knowing.
+    on_path = behind or abs(now.sensors.lidar_min_bearing) <= PATH_BEARING_TOL
+
+    if need > LIDAR_MAX_RANGE:
+        # Previously this came back as "occupied at 40.0 m", reporting the
+        # sensor's own range limit as an occupancy fact. Not seeing anything
+        # as far as you can see is not the same as seeing that it is clear.
+        return RevertVerdict(
+            False, f"{side} return path of {path_len:.1f} m runs past the "
+            f"{LIDAR_MAX_RANGE:.0f} m sensor horizon", cost_m=path_len)
+    if on_path and clearance < LIDAR_MAX_RANGE and clearance < need:
+        return RevertVerdict(
+            False, f"{side} return path is occupied at {clearance:.1f} m",
+            cost_m=path_len)
+    return RevertVerdict(True, f"reachable, {path_len:.1f} m of return path",
+                         goal=goal, cost_m=path_len)
 
 
 def _state_at(repo: str, rev: str) -> tuple[dict | None, str]:
