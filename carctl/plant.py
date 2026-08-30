@@ -54,6 +54,7 @@ class Plant:
         self.t = 0.0
         self.seq = 0
         self.s_along = 0.0  # arc length, used to place the stop line
+        self.prev_light_dist = STOP_LINE_S
         self.checkpoints = dict(checkpoints or CHECKPOINTS)
 
     def _light(self) -> tuple[str, float]:
@@ -102,6 +103,16 @@ class Plant:
         if maneuver == "park" and self.t >= 13.1:
             curb = 41.0  # curb strike: irreversible, and the IMU says so
 
+        # The crossing is one tick, not every tick after it.
+        crossed_now = self.prev_light_dist > 0 >= light_dist
+        self.prev_light_dist = light_dist
+
+        # Something is behind us during the parking manoeuvre. The forward
+        # cone cannot see it, which is the whole reason this reading exists.
+        lidar_rear = 40.0
+        if maneuver == "park":
+            lidar_rear = max(0.8, 5.0 - (self.t - 12.5) * 3.0)
+
         sensors = Sensors(
             lidar_min_range=lidar,
             lidar_min_bearing=0.0 if lidar > 20 else -0.4,
@@ -110,6 +121,8 @@ class Plant:
             lateral_offset=math.sin(self.t * 1.7) * 0.12,
             wheel_slip=0.02 if brake < 0.5 else 0.11,
             imu_accel_z=9.81 + curb,
+            lidar_min_range_rear=lidar_rear,
+            stop_line_crossed=crossed_now and self.true_light() == "red",
         )
         actuators = Actuators(throttle=round(throttle, 3),
                               brake=round(brake, 3),
@@ -117,7 +130,8 @@ class Plant:
 
         # Reversibility is decided here, at capture time, not at revert time.
         # Anything that dissipated energy into the world is a one-way door.
-        reversible = curb == 0.0 and lidar > 2.0 and light_dist > 0
+        reversible = (curb == 0.0 and lidar > 2.0
+                      and not sensors.stop_line_crossed)
 
         frame = Frame(
             seq=self.seq,

@@ -23,6 +23,11 @@ class Sensors:
     lateral_offset: float    # m from lane centre, + is left
     wheel_slip: float        # 0..1
     imu_accel_z: float       # m/s^2, spikes on curb strikes
+    lidar_min_range_rear: float = 40.0
+    # True only on the tick the stop line passes under the car. light_distance
+    # stays negative for the rest of the drive, so anything derived from its
+    # sign latches and never recovers.
+    stop_line_crossed: bool = False
 
 
 @dataclass(frozen=True)

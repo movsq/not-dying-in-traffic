@@ -54,7 +54,7 @@ def detect(f: Frame, true_light: str) -> Incident | None:
     if f.sensors.lidar_min_range < MIN_CLEARANCE:
         return Incident("collision", f.seq,
                         f"clearance={f.sensors.lidar_min_range:.2f} m")
-    if true_light == "red" and f.sensors.light_distance <= 0 and f.pose.v > 1.0:
+    if true_light == "red" and f.sensors.stop_line_crossed and f.pose.v > 1.0:
         return Incident("red_light_run", f.seq,
                         f"crossed stop line at {f.pose.v * 3.6:.0f} km/h "
                         f"while perception reported '{f.sensors.light_state}'")
@@ -93,9 +93,15 @@ def reachable(now: Frame, goal: dict) -> RevertVerdict:
         return RevertVerdict(False,
             f"goal is {dist:.1f} m behind at {now.pose.v * 3.6:.0f} km/h; "
             "reversing is inadmissible above 7 km/h", cost_m=dist)
-    if now.sensors.lidar_min_range < dist + MIN_CLEARANCE:
+    # The forward cone says nothing about a path behind the car. Picking the
+    # wrong sensor here refuses clear reverses and, worse, clears occupied ones.
+    ahead_or_behind = ("rear" if behind else "forward")
+    clearance = (now.sensors.lidar_min_range_rear if behind
+                 else now.sensors.lidar_min_range)
+    if clearance < dist + MIN_CLEARANCE:
         return RevertVerdict(False,
-            "return path is occupied", cost_m=dist)
+            f"{ahead_or_behind} return path is occupied at {clearance:.1f} m",
+            cost_m=dist)
     return RevertVerdict(True, f"reachable, {dist:.1f} m of return path",
                          goal=goal, cost_m=dist)
 

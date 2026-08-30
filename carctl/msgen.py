@@ -45,6 +45,6 @@ def _why(f: Frame) -> str:
         return "vertical-accel-spike"
     if f.sensors.lidar_min_range <= 2.0:
         return "object-inside-braking-distance"
-    if f.sensors.light_distance <= 0:
+    if f.sensors.stop_line_crossed:
         return "stop-line-crossed"
     return "unknown"
