@@ -1,8 +1,8 @@
 """The record plane.
 
 Hard rule: the control loop never calls git. `git commit` forks, execs, builds
-an index and fsyncs — tens of milliseconds with an unbounded tail. That does
-not belong anywhere near a 100 ms deadline.
+an index and fsyncs. Tens of milliseconds, with a tail you cannot bound. That
+does not belong anywhere near a 100 ms deadline.
 
 So the loop hands frames to a bounded queue and moves on. A committer thread
 drains that queue into a single long-lived `git fast-import` process, which
@@ -24,8 +24,8 @@ import queue, subprocess, tempfile, threading
 from .state import Frame
 from . import msgen
 
-CHECKPOINT_EVERY = 50   # frames — 5 s of driving
-QUEUE_DEPTH = 512       # frames — ~51 s of backlog before we start dropping
+CHECKPOINT_EVERY = 50   # frames, 5 s of driving
+QUEUE_DEPTH = 512       # frames, about 51 s of backlog before we start dropping
 
 IDENT = b"not-dying-in-traffic <vsedlacek1337@gmail.com>"
 

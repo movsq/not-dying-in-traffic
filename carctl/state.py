@@ -1,4 +1,4 @@
-"""Vehicle state — the thing that gets committed every 100 ms."""
+"""Vehicle state. This is what gets committed every 100 ms."""
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 import json
@@ -40,7 +40,7 @@ class Actuators:
 @dataclass(frozen=True)
 class Frame:
     seq: int
-    t_mono_ns: int        # monotonic clock — the only clock control logic trusts
+    t_mono_ns: int        # monotonic, the only clock control logic trusts
     t_wall_s: int         # wall clock, for the commit timestamp only
     pose: Pose
     sensors: Sensors

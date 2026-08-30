@@ -82,9 +82,12 @@ sensors. Not later, by code that is guessing.
 `git revert` on a source tree always works. Any diff inverts. Physics does not
 work that way, so revert splits in two.
 
-**Record revert.** A real `git revert`, run in a detached control worktree so
-it can never race fast-import writing to `main`. It always succeeds. What it
-produces is an auditable statement that a frame was wrong.
+**Record revert.** A real `git revert`, run in a throwaway detached worktree so
+it can never race fast-import writing to `main`. What it produces is an
+auditable statement that a frame was wrong, anchored under
+`refs/reverts/<original>` so it does not sit unreachable on a detached HEAD.
+Every step is checked. An earlier version swallowed three exit codes in a row
+and printed a stale sha that looked like a fresh revert.
 
 **Physical revert.** Read the parent commit's `state.json`, treat that pose as
 a goal, and check whether the goal is still inside the reachable set from where
@@ -164,12 +167,24 @@ git stash pop  -> CONFLICT
 A stash that cannot notice that conflict is worse than no stash, because it
 confidently replays a plan built for a world that is gone.
 
+The TTL runs on wall clock, not the simulated one. Simulated time restarts at
+zero in each process, so an entry saved an hour ago used to compute an age of
+0.0 s and pass the freshness check. `carctl park` also sweeps expired entries
+before it starts, because the normal outcome of a parking attempt is a conflict
+with the stash kept, and nothing was ever retiring them.
+
 ## The red button
 
 `git revert --hard` is not a git command. The button is not one either. It
 freezes the record at the last reversible frame and runs a minimal risk
-manoeuvre. The confirmation dialog says what you asked for, and under it, the
-two numbers that disagree.
+manoeuvre. It is guarded by a same-origin check and a token minted at startup
+that only ever reaches the served page. Binding to localhost is not access
+control, and a plain form POST from any other page in the same browser is a
+CORS simple request that nothing preflights. Halting a vehicle should take more
+than an open tab.
+
+The confirmation dialog says what you asked for, and under it, the two numbers
+that disagree.
 
 ```
 are you sure? this cannot be undone (physically)
@@ -193,14 +208,29 @@ origin  https://github.com/movsq/not-dying-in-traffic.git
 `main` never leaves the car. Exact poses at 10 Hz are a location feed for one
 named person, and git history outlives anyone deleting it later. `public` is
 what gets pushed, rebuilt from `main` by streaming `git fast-export` through a
-filter and back into `git fast-import`. Poses snap to a 25 m grid, commit times
-round to the minute, street names and manoeuvres and the reversible flag come
-through untouched. Those are the parts worth reading anyway.
+filter and back into `git fast-import`.
+
+Three things get rewritten, and it has to be all three, because a commit
+carries location in more places than its tree. The blob, where poses snap to a
+25 m grid. The message, where the `Pose:` trailer snaps to the same grid. The
+identity, which becomes an anonymous address with the timestamp rounded to the
+minute. I originally scrubbed only the blob, which accomplished nothing. The
+exact trajectory was sitting in the body of every commit right next to the
+coarsened one, and the committer email was on all 560 of them.
 
 ```
-main   "x": 41.846469430637235, "y": 89.7491853669169
-public "x": 50.0, "y": 100.0
+main    state.json  "x": 41.846469430637235, "y": 89.7491853669169
+        message     Pose: 41.85,89.75 @ 0.9498 rad
+        committer   a real personal address
+
+public  state.json  "x": 50.0, "y": 100.0
+        message     Pose: 50.00,100.00 @ 0.9 rad
+        committer   fleet@not-dying-in-traffic.invalid
 ```
+
+`publish.audit()` re-reads the built ref and refuses the push if either an
+unsnapped pose or a non-public identity survived. A push is the one step you
+cannot take back, so it gets a gate that does not depend on me remembering.
 
 The push refspec is pinned in `.git/config` to
 `refs/heads/public:refs/heads/main`, and `push.default` is `nothing`, so a bare
@@ -248,11 +278,19 @@ dropped frames      0
 deadline overruns   1
 max jitter       0.62 ms
 max submit cost  25.0 us   <- the loop's entire git bill
+tagged as        drive-0007
 incidents           2  (red_light_run @ seq 110, curb_strike @ seq 132)
 ```
 
 At 10 Hz the car commits 864,000 times a day. That number is the thing I would
 worry about first if this ran for a week.
+
+## Source
+
+The code lives on `refs/heads/src`, not `main`. `main` is drive data, and
+mixing the two would put source files in every frame commit and push them to
+the public ref. `git log src` is the code history; `git log main` is the
+driving.
 
 ## What is missing
 

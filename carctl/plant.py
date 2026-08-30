@@ -4,7 +4,7 @@ import math, time
 from .state import Pose, Sensors, Actuators, Frame
 
 WHEELBASE = 2.7  # m
-DT = 0.1         # s — one tick, one commit
+DT = 0.1         # s, one tick, one commit
 
 # The scripted drive. (t_start, road, maneuver, steer_cmd, target_speed)
 SCRIPT = [

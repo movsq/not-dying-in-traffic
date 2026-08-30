@@ -1,6 +1,6 @@
 """The 100 ms loop.
 
-Absolute deadlines, never `sleep(0.1)` — sleeping a fixed interval accumulates
+Absolute deadlines, never `sleep(0.1)`. Sleeping a fixed interval accumulates
 every tick's overrun into permanent drift, and a drifting safety loop lies
 about its own timestamps. We schedule against a fixed epoch and measure the
 jitter, because the loop's real product is not the commits, it is the promise

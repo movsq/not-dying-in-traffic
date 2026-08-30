@@ -4,11 +4,11 @@
 not. So a revert here splits into two independent operations that are allowed
 to disagree, and the whole design hangs on keeping them separate:
 
-  RECORD REVERT   — a real `git revert` in the control worktree. Always
+  RECORD REVERT   is a real `git revert` in the control worktree. Always
                     succeeds. Produces the public, auditable statement "this
                     frame was wrong". Costs nothing physical.
 
-  PHYSICAL REVERT — read the parent commit's state.json, treat it as a goal
+  PHYSICAL REVERT reads the parent commit's state.json, treats it as a goal
                     pose, and ask the planner whether it is inside the
                     reachable set from where the car is *now*. If yes, drive
                     there. If no, the revert is refused and the car runs a

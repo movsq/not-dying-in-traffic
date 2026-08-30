@@ -49,24 +49,24 @@
 <main>
   <section>
     <h2>Vehicle</h2>
-    <div class="speed"><span id="kmh">–</span><small> km/h</small></div>
+    <div class="speed"><span id="kmh">-</span><small> km/h</small></div>
     <dl style="margin-top:14px">
-      <dt>road</dt><dd id="road">–</dd>
-      <dt>manoeuvre</dt><dd id="man">–</dd>
-      <dt>pose</dt><dd id="pose">–</dd>
-      <dt>steer</dt><dd id="steer">–</dd>
-      <dt>signal</dt><dd id="light">–</dd>
-      <dt>clearance</dt><dd id="clr">–</dd>
+      <dt>road</dt><dd id="road">-</dd>
+      <dt>manoeuvre</dt><dd id="man">-</dd>
+      <dt>pose</dt><dd id="pose">-</dd>
+      <dt>steer</dt><dd id="steer">-</dd>
+      <dt>signal</dt><dd id="light">-</dd>
+      <dt>clearance</dt><dd id="clr">-</dd>
     </dl>
   </section>
 
   <section>
     <h2>HEAD</h2>
-    <div class="commit" id="commit">–</div>
+    <div class="commit" id="commit">-</div>
     <dl style="margin-top:14px">
-      <dt>reversible</dt><dd id="rev">–</dd>
-      <dt>last good seq</dt><dd id="lastgood">–</dd>
-      <dt>perception</dt><dd id="ckpt">–</dd>
+      <dt>reversible</dt><dd id="rev">-</dd>
+      <dt>last good seq</dt><dd id="lastgood">-</dd>
+      <dt>perception</dt><dd id="ckpt">-</dd>
     </dl>
     <div class="incident" id="inc" hidden></div>
   </section>
@@ -124,7 +124,7 @@ es.onmessage = e => {
   $('ckpt').textContent = (d.checkpoints.perception || '').replace('ckpt-perception-','');
   if (d.incident) {
     $('inc').hidden = false;
-    $('inc').textContent = d.incident.kind + ' — ' + d.incident.detail +
+    $('inc').textContent = d.incident.kind + ': ' + d.incident.detail +
                            '  [owner: ' + d.incident.owner + ']';
   }
 };
@@ -159,7 +159,7 @@ function halt(note) {
   $('resume').hidden = false;
   $('conn').textContent = 'HALTED';
   $('btn').disabled = true;
-  $('btn').textContent = 'reverted — record frozen';
+  $('btn').textContent = 'reverted , record frozen';
   $('hint').textContent = note;
 }
 </script>
