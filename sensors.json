@@ -1,9 +1,9 @@
 {
  "imu_accel_z": 9.8,
  "lane_ref": "Je\u010dn\u00e1:1",
- "lateral_offset": -0.8,
+ "lateral_offset": -0.7,
  "lidar_min_bearing": -0.4,
- "lidar_min_range": 9.2,
+ "lidar_min_range": 8.5,
  "lidar_min_range_rear": 40.0,
  "light_distance": -25.0,
  "light_state": "red",
