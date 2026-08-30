@@ -105,6 +105,11 @@ es.onerror = () => $('conn').textContent = 'stream lost';
 es.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.halted) { halt(d.note); return; }
+  // Another tab pressed resume. With no branch here the payload fell through
+  // to the frame renderer, d.kmh.toFixed threw, and this tab stayed locked in
+  // the halted UI -- dead red button under a HALTED banner -- while the
+  // vehicle was driving again and the readings below it kept updating.
+  if (d.resumed) { unhalt(); return; }
   if (last && d.seq < last.seq) { $('inc').hidden = true; }  // new drive, clear stale incident
   last = d;
   $('seq').textContent  = 'seq ' + d.seq;
@@ -143,15 +148,39 @@ $('btn').onclick = () => {
 $('no').onclick  = () => $('dlg').close();
 const TOKEN = '__REVERT_TOKEN__';   // minted per server start, served only here
 
+const BTN_LABEL = $('btn').textContent;
+
 $('yes').onclick = async () => {
   $('dlg').close();
-  const r = await fetch('/revert-hard',
-    {method:'POST', headers:{'X-Revert-Token': TOKEN}});
-  halt(JSON.stringify(await r.json()));
+  let r, body;
+  try {
+    r = await fetch('/revert-hard',
+      {method:'POST', headers:{'X-Revert-Token': TOKEN}});
+    body = await r.json();
+  } catch (err) {
+    refused('halt request failed: ' + err);
+    return;
+  }
+  // A refusal is valid JSON too, so awaiting r.json() and calling halt()
+  // unconditionally rendered a 403 as a completed halt: HALTED banner, button
+  // disabled, vehicle still driving with its speed updating underneath. On
+  // this control a refusal and a success must never look the same.
+  if (!r.ok || !body.ok) {
+    refused(body && body.refused ? body.refused : 'HTTP ' + r.status);
+    return;
+  }
+  halt(JSON.stringify(body));
 };
 
 $('resume').onclick = async () => {
-  await fetch('/resume', {method:'POST', headers:{'X-Revert-Token': TOKEN}});
+  let r;
+  try {
+    r = await fetch('/resume', {method:'POST', headers:{'X-Revert-Token': TOKEN}});
+  } catch (err) {
+    refused('resume request failed: ' + err);
+    return;
+  }
+  if (!r.ok) { refused('resume refused: HTTP ' + r.status); return; }
   location.reload();
 };
 
@@ -161,5 +190,22 @@ function halt(note) {
   $('btn').disabled = true;
   $('btn').textContent = 'reverted , record frozen';
   $('hint').textContent = note;
+}
+
+function unhalt() {
+  $('resume').hidden = true;
+  $('conn').textContent = 'streaming @ 10 Hz';
+  $('btn').disabled = false;
+  $('btn').textContent = BTN_LABEL;
+  $('hint').textContent = '';
+}
+
+// The button stays live and says why. Leaving it disabled after a refusal
+// meant the operator could not try again without reloading the page.
+function refused(why) {
+  $('conn').textContent = 'halt REFUSED';
+  $('btn').disabled = false;
+  $('btn').textContent = BTN_LABEL;
+  $('hint').textContent = 'HALT REFUSED: ' + why;
 }
 </script>
