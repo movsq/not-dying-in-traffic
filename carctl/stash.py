@@ -13,7 +13,7 @@ it replays a plan built for a world that is gone. Hence `preconditions`: the
 facts the stashed plan depended on, checked again at pop time.
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 import json, subprocess, uuid
 from .state import Frame
 
@@ -47,6 +47,7 @@ class StashEntry:
     return_pose: dict
     preconditions: dict
     attempt: int
+    t_wall_s: int = 0
 
 
 class ParkingStash:
@@ -61,15 +62,28 @@ class ParkingStash:
         """Save the pose we can return to, and the facts we are betting on."""
         sid = uuid.uuid4().hex[:8]
         ref = f"refs/parking/{sid}"
-        head = self._git("rev-parse", "refs/heads/main").stdout.strip()
-        self._git("update-ref", ref, head)
+        head = self._git("rev-parse", "--verify", "--quiet",
+                         "refs/heads/main").stdout.strip()
+        if not head:
+            # Writing the meta ref anyway produced entries whose parking ref
+            # did not exist, which list() happily returned and drop() could
+            # not remove.
+            raise RuntimeError("no refs/heads/main to anchor a stash to; "
+                               "run a drive first")
+        r = self._git("update-ref", ref, head)
+        if r.returncode != 0:
+            raise RuntimeError(f"could not create {ref}: {r.stderr.strip()}")
         entry = StashEntry(
             id=sid, ref=ref, seq=f.seq, t_mono_ns=f.t_mono_ns,
+            t_wall_s=f.t_wall_s,
             return_pose={"x": f.pose.x, "y": f.pose.y,
                          "heading": f.pose.heading, "v": 0.0},
             preconditions=asdict(pre), attempt=attempt)
-        blob = self._git_hash(json.dumps(asdict(entry), indent=2) + "\n")
-        self._git("update-ref", f"refs/parking-meta/{sid}", blob)
+        blob = self._git_hash(json.dumps(asdict(entry), indent=2) + chr(10))
+        meta = self._git("update-ref", f"refs/parking-meta/{sid}", blob)
+        if meta.returncode != 0:
+            self._git("update-ref", "-d", ref)   # do not leave a half entry
+            raise RuntimeError(f"could not record stash meta: {meta.stderr.strip()}")
         return entry
 
     def _git_hash(self, text: str) -> str:
@@ -83,15 +97,27 @@ class ParkingStash:
                         "refs/parking-meta/").stdout.split()
         entries = []
         for ref in out:
-            blob = ref.rsplit("/", 1)[-1]
             oid = self._git("rev-parse", ref).stdout.strip()
-            entries.append(StashEntry(**json.loads(
-                self._git("cat-file", "-p", oid).stdout)))
+            raw = json.loads(self._git("cat-file", "-p", oid).stdout)
+            known = {fld.name for fld in fields(StashEntry)}
+            entries.append(StashEntry(**{k: v for k, v in raw.items()
+                                         if k in known}))
         return sorted(entries, key=lambda e: e.seq)
+
+    def age_s(self, entry: StashEntry, now: Frame) -> float:
+        """Monotonic time is per-process and restarts at zero, so an entry from
+        an earlier run always looked brand new and the TTL never fired. Wall
+        clock decides across processes; the monotonic clock still decides
+        within one drive, where it is the trustworthy one."""
+        same_run = 0 <= now.t_mono_ns - entry.t_mono_ns < 3_600 * 10**9
+        wall = now.t_wall_s - entry.t_wall_s
+        if same_run and wall < TTL_S:
+            return (now.t_mono_ns - entry.t_mono_ns) / 1e9
+        return float(wall)
 
     def pop(self, entry: StashEntry, now: Frame, now_pre: Preconditions):
         """Three-way merge against the street. Returns (ok, conflicts)."""
-        age = (now.t_mono_ns - entry.t_mono_ns) / 1e9
+        age = self.age_s(entry, now)
         conflicts = []
         if age > TTL_S:
             conflicts.append(f"stale: {age:.1f}s > TTL {TTL_S:.0f}s")
@@ -99,6 +125,17 @@ class ParkingStash:
         if conflicts:
             return False, conflicts
         return True, []
+
+    def sweep(self, now: Frame) -> list[str]:
+        """Drop entries past their TTL. Nothing did this before, and the normal
+        outcome of a parking attempt is CONFLICT with the stash kept, so
+        refs/parking/* grew by one on every single run."""
+        dropped = []
+        for e in self.list():
+            if self.age_s(e, now) > TTL_S:
+                self.drop(e)
+                dropped.append(e.ref)
+        return dropped
 
     def drop(self, entry: StashEntry) -> None:
         self._git("update-ref", "-d", entry.ref)

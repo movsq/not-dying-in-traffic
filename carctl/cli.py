@@ -92,6 +92,9 @@ def cmd_park(args):
     plant = Plant()
     for _ in range(125):
         f = plant.step()
+    swept = st.sweep(f)
+    if swept:
+        print(f"swept {len(swept)} stash entr(ies) past TTL")
     pre = Preconditions(gap_length_m=6.1, lead_vehicle_x=f.pose.x + 7.0,
                         follow_vehicle_x=f.pose.x - 1.2, clearance_m=0.55)
     entry = st.push(f, pre, attempt=1)
