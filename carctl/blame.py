@@ -6,7 +6,7 @@ which, for a car that hot-swaps checkpoints over the air mid-drive, is the
 commit where the offending model was promoted.
 """
 from __future__ import annotations
-import json, subprocess, pathlib
+import json, pathlib, shlex, subprocess
 
 
 def _git(repo: str, *args: str) -> str:
@@ -53,6 +53,14 @@ def attribute(repo: str, sha: str, subsystem: str) -> dict:
 def bisect_script(repo: str, good: str, bad: str) -> str:
     """`git bisect` across a fleet-wide history finds the first drive where a
     checkpoint regressed. Emitted as a script rather than run, because bisect
-    on a live vehicle is not a thing."""
-    return (f"git -C {repo} bisect start {bad} {good}\n"
-            f"git -C {repo} bisect run carctl replay --assert-no-incident\n")
+    on a live vehicle is not a thing.
+
+    Everything interpolated is quoted, and the path is emitted POSIX style.
+    The repo path used to go in raw, so on Windows a shell ate the backslashes
+    and `git -C` received C:Usersfixednot-dying-in-traffic; a path containing a
+    space broke it the same way. A rev like `x; curl ...` became a second
+    command in a script whose entire purpose is to be pasted and run.
+    """
+    r = shlex.quote(pathlib.PurePath(repo).as_posix())
+    return (f"git -C {r} bisect start {shlex.quote(bad)} {shlex.quote(good)}\n"
+            f"git -C {r} bisect run carctl replay --assert-no-incident\n")
