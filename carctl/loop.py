@@ -13,6 +13,8 @@ from .plant import Plant, DT
 from .gitstore import Committer
 from . import safety
 
+RELATCH_TICKS = 20      # 2 s clear of a kind before it counts as a new event
+
 
 @dataclass
 class DriveReport:
@@ -58,7 +60,15 @@ def drive(repo: str, seconds: float, realtime: bool = True,
     committer.start()
     rep = DriveReport()
 
-    latched: set[str] = set()
+    # kind -> tick it was last true. A set that was only added to could never
+    # re-arm; this expires.
+    latched: dict[str, int] = {}
+    # Ground truth is asked for, not required. `plant.true_light()` was called
+    # unconditionally, so the loop could not be pointed at anything but the
+    # simulator, which is exactly the claim that replacing the plant is all a
+    # real vehicle would need. A plant without it falls back to what
+    # perception reported, which is all a real vehicle can know at the time.
+    oracle = getattr(plant, "true_light", None)
     epoch = time.monotonic()
     # round, not int. `int(2.9 / 0.1)` is 28, because 2.9/0.1 is
     # 28.999999999999996 in binary -- 196 of the first 600 tenth-second
@@ -88,11 +98,20 @@ def drive(repo: str, seconds: float, realtime: bool = True,
 
             # Safety runs before the commit. The record must never be the
             # thing standing between a hazard and the brakes.
-            fresh = [i for i in safety.detect(frame, plant.true_light())
-                     if i.kind not in latched]
-            for i in fresh:                 # a repeat kind is the same event
-                latched.add(i.kind)         # still unfolding, not a new one
-                rep.incidents.append(i)
+            truth = oracle() if oracle else frame.sensors.light_state
+            seen = safety.detect(frame, truth)
+            kinds_now = {s.kind for s in seen}
+            # Release a latch once its condition has been clear for a while.
+            # The set was only ever added to, so a second genuinely separate
+            # incident of the same kind later in the same drive was discarded
+            # as "still unfolding" however long the gap between them.
+            for kind in [k for k, t in latched.items()
+                         if k not in kinds_now and i - t > RELATCH_TICKS]:
+                del latched[kind]
+            fresh = [s for s in seen if s.kind not in latched]
+            for s in seen:                  # refresh while it persists
+                latched[s.kind] = i
+            rep.incidents.extend(fresh)
             # on_frame still takes a single incident: the most severe one that
             # is new this tick, or None.
             inc = fresh[0] if fresh else None
