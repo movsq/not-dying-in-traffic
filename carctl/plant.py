@@ -64,6 +64,12 @@ SCRIPT = [
     (10.6, "Hlavní",      "cruise",      0.00, 12.0, 1),
     (11.5, "Hlavní",      "brake",       0.00,  2.0, 1),
     (12.5, "Hlavní",      "park",       -0.35,  1.5, None),
+    # Past the end of the 14 s drive, so it changes nothing about that one.
+    # A car that never comes to rest is a car maintenance can never run on:
+    # retain.stationary() reads the last committed frame's speed, and the
+    # scripted park settles at 1.5 m/s and holds it forever. It also gives
+    # msgen's "stop" verb something to describe, which nothing produced.
+    (14.0, "Hlavní",      "stop",        0.00,  0.0, None),
 ]
 
 # The stop line the car is going to blow through, because the perception

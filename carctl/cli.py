@@ -1,6 +1,8 @@
 from __future__ import annotations
 import argparse, json, os, re, subprocess, sys
-from . import blame as blamemod, loop as loopmod, publish as pubmod, safety, stash as stashmod
+from . import (blame as blamemod, lineage as lineagemod, loop as loopmod,
+               publish as pubmod, retain as retainmod, safety,
+               stash as stashmod)
 from .plant import Plant
 from .stash import Preconditions
 
@@ -49,6 +51,7 @@ def cmd_drive(args):
     print(f"ticks           {rep.ticks}")
     print(f"committed       {rep.committed}")
     print(f"dropped frames  {rep.dropped}")
+    print(f"promotions      {rep.promotions}   <- commits on {lineagemod.REF}")
     print(f"deadline overruns {rep.overruns}")
     print(f"max jitter      {rep.max_jitter_ms:.2f} ms")
     print(f"max submit cost {rep.max_submit_us:.1f} us   <- the loop's entire git bill")
@@ -145,6 +148,32 @@ def cmd_park(args):
         st.drop(entry); print("dropped")
 
 
+def cmd_lineage(args):
+    """The ref that outlives the frames: one commit per checkpoint promotion."""
+    if args.backfill or args.rebuild:
+        n, msg = lineagemod.backfill(REPO, rebuild=args.rebuild)
+        print(msg)
+        if not n:
+            return
+    if _git("rev-parse", "--verify", "--quiet", lineagemod.REF).strip() == "":
+        print(f"{lineagemod.REF} does not exist. Seed it from the promotions "
+              f"already on main with:  carctl lineage --backfill")
+        return
+    n = _git("rev-list", "--count", lineagemod.REF).strip()
+    print(f"{lineagemod.REF}  {n} promotion(s), kept indefinitely")
+    print()
+    print(_git("log", f"-n{args.n}", "--format=%h  %ad  %s%n"
+               "            %(trailers:key=Promoted,valueonly,separator=%x20)"
+               "%n            during %(trailers:key=Drive,valueonly)",
+               "--date=format:%Y-%m-%d %H:%M", lineagemod.REF), end="")
+
+
+def cmd_maintain(args):
+    """Retention and repack. Runs only while the vehicle is stopped."""
+    for line in retainmod.maintain(REPO, args.days, args.dry_run):
+        print(line)
+
+
 def cmd_bisect(args):
     tags = _git("for-each-ref", "--format=%(refname:short)",
                 "refs/tags/drive-*").split()
@@ -208,6 +237,22 @@ def main(argv=None):
     b = sub.add_parser("bisect")
     b.add_argument("--good"); b.add_argument("--bad")
     b.set_defaults(func=cmd_bisect)
+
+    ln = sub.add_parser("lineage")
+    ln.add_argument("-n", type=int, default=20)
+    ln.add_argument("--backfill", action="store_true",
+                    help="seed an empty ref from the promotions already on main")
+    ln.add_argument("--rebuild", action="store_true",
+                    help="replace an existing ref from main, keeping the old "
+                         "tip under refs/backup/")
+    ln.set_defaults(func=cmd_lineage)
+
+    m = sub.add_parser("maintain")
+    m.add_argument("--days", type=float, default=retainmod.MAIN_WINDOW_DAYS,
+                   help="how much full-frame history main keeps")
+    m.add_argument("--dry-run", action="store_true",
+                   help="say what would be dropped, change nothing")
+    m.set_defaults(func=cmd_maintain)
 
     pb = sub.add_parser("publish")
     pb.add_argument("--push", action="store_true",

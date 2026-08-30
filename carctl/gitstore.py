@@ -18,11 +18,18 @@ Two consequences worth knowing about:
   * The queue drops oldest on overflow rather than blocking. A stalled disk
     must cost you history, never a control cycle. Drops are counted and
     reported; a drop is a defect, not a normal condition.
+
+The same stream also writes refs/heads/lineage: one commit carrying only
+models.json, every time a checkpoint changes. It goes down the same pipe
+rather than through a separate git call so that a promotion and the first
+frame that ran under it become visible at the same checkpoint. main has a
+retention window and that ref does not, so once main is pruned the lineage ref
+is the only surviving record of when a model shipped. See lineage.py.
 """
 from __future__ import annotations
 import queue, subprocess, tempfile, threading, time
 from .state import Frame
-from . import msgen
+from . import lineage, msgen
 
 CHECKPOINT_EVERY = 50   # frames, 5 s of driving
 QUEUE_DEPTH = 512       # frames, about 51 s of backlog before we start dropping
@@ -50,13 +57,22 @@ def _tz_offset(epoch_s: int) -> bytes:
 class Committer:
     """Owns the fast-import process. One instance per drive."""
 
-    def __init__(self, repo: str, ref: str = "refs/heads/main"):
+    def __init__(self, repo: str, ref: str = "refs/heads/main",
+                 lineage_ref: str = lineage.REF, drive_tag: str = ""):
         self.repo = repo
         self.ref = ref.encode()
+        self.lineage_ref = lineage_ref.encode()
+        # Named at drive start, created at drive end. The lineage commits
+        # written mid-drive have to say which drive they happened during, and
+        # a tag that does not exist yet still has a name.
+        self.drive_tag = drive_tag
         self.q: queue.Queue[Frame | None] = queue.Queue(maxsize=QUEUE_DEPTH)
         self.dropped = 0
         self.committed = 0
+        self.promotions = 0
         self._need_from = False
+        self._lineage_from = False
+        self._models: str | None = None
         self.error: Exception | None = None
         self._alive = True
         self._stderr = None
@@ -96,6 +112,12 @@ class Committer:
             ["git", "rev-parse", "--verify", "--quiet", self.ref.decode()],
             cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
         self._need_from = existing.returncode == 0
+        # What the lineage ref already says is in force. Comparing against
+        # this rather than against the first frame is what makes a checkpoint
+        # swapped while the vehicle was parked show up as a promotion instead
+        # of vanishing into the gap between two drives.
+        self._models = lineage.models_at(self.repo, self.lineage_ref.decode())
+        self._lineage_from = self._models is not None
         # stderr goes to a file, not a pipe. Nothing reads a pipe until
         # communicate() at the very end, so a few hundred warning lines fill
         # the OS buffer, fast-import blocks writing stderr, stops reading
@@ -126,6 +148,25 @@ class Committer:
         out.append(b"\n")
         return b"".join(out)
 
+    def _emit_lineage(self, f: Frame, models: str) -> bytes:
+        """One commit carrying models.json and nothing else."""
+        changed = lineage.changes(self._models, models)
+        msg = lineage.message(changed, f.t_wall_s, self.drive_tag, f.seq)
+        out = [b"commit " + self.lineage_ref + b"\n",
+               b"committer " + IDENT + b" %d " % f.t_wall_s
+               + _tz_offset(f.t_wall_s) + b"\n",
+               _data(msg.encode())]
+        if self._lineage_from:
+            # Same trap as main: a fresh fast-import roots the first commit on
+            # a ref it has not seen, which would orphan every promotion the
+            # vehicle has ever recorded.
+            out.append(b"from " + self.lineage_ref + b"^0\n")
+            self._lineage_from = False
+        out.append(b"M 100644 inline models.json\n")
+        out.append(_data(models.encode()))
+        out.append(b"\n")
+        return b"".join(out)
+
     def _drain(self) -> None:
         assert self._proc and self._proc.stdin
         stdin = self._proc.stdin
@@ -135,6 +176,15 @@ class Committer:
                 f = self.q.get()
                 if f is None:
                     break
+                models = f.models_json()
+                if models != self._models:
+                    # Before the frame, not after: if the stream dies here the
+                    # record shows a promotion with no frames under it, which
+                    # is readable. The other order shows frames running a
+                    # checkpoint nothing recorded shipping.
+                    stdin.write(self._emit_lineage(f, models))
+                    self._models = models
+                    self.promotions += 1
                 stdin.write(self._emit(f))
                 self.committed += 1
                 since_ckpt += 1
