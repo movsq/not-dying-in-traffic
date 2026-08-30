@@ -38,6 +38,12 @@ class Preconditions:
         return c
 
 
+# One id per process. The monotonic clock restarts at zero on every run, so a
+# delta between two processes' readings is a meaningless number that happens
+# to look entirely plausible. This is what tells the two cases apart.
+RUN_ID = uuid.uuid4().hex[:12]
+
+
 @dataclass
 class StashEntry:
     id: str
@@ -48,6 +54,7 @@ class StashEntry:
     preconditions: dict
     attempt: int
     t_wall_s: int = 0
+    run_id: str = ""        # empty on entries written before this existed
 
 
 class ParkingStash:
@@ -75,7 +82,7 @@ class ParkingStash:
             raise RuntimeError(f"could not create {ref}: {r.stderr.strip()}")
         entry = StashEntry(
             id=sid, ref=ref, seq=f.seq, t_mono_ns=f.t_mono_ns,
-            t_wall_s=f.t_wall_s,
+            t_wall_s=f.t_wall_s, run_id=RUN_ID,
             return_pose={"x": f.pose.x, "y": f.pose.y,
                          "heading": f.pose.heading, "v": 0.0},
             preconditions=asdict(pre), attempt=attempt)
@@ -108,12 +115,20 @@ class ParkingStash:
         """Monotonic time is per-process and restarts at zero, so an entry from
         an earlier run always looked brand new and the TTL never fired. Wall
         clock decides across processes; the monotonic clock still decides
-        within one drive, where it is the trustworthy one."""
-        same_run = 0 <= now.t_mono_ns - entry.t_mono_ns < 3_600 * 10**9
-        wall = now.t_wall_s - entry.t_wall_s
-        if same_run and wall < TTL_S:
+        within one drive, where it is the trustworthy one.
+
+        "Same run" used to be inferred -- a positive monotonic delta under an
+        hour -- which is precisely what a restart also produces. A 44 s old
+        stash then reported 7.6 s and popped clean, replaying a parking plan
+        onto a street that had moved on. It is an identity check now.
+        """
+        if entry.run_id and entry.run_id == RUN_ID:
             return (now.t_mono_ns - entry.t_mono_ns) / 1e9
-        return float(wall)
+        # Across processes only the wall clock means anything, and t_wall_s
+        # carries whole seconds, so the true age is somewhere in
+        # [wall - 1, wall + 1]. A TTL wants the upper bound: truncating let a
+        # 45.9 s entry report 45.0 and slip under a 45 s expiry.
+        return float(now.t_wall_s - entry.t_wall_s) + 1.0
 
     def pop(self, entry: StashEntry, now: Frame, now_pre: Preconditions):
         """Three-way merge against the street. Returns (ok, conflicts)."""
