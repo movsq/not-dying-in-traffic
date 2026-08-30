@@ -282,9 +282,14 @@ def window_cut(repo: str, days: float = MAIN_WINDOW_DAYS,
     note = f"{len(kept)} frame(s) inside the {days:g} day window"
     cut = kept[-1] if kept else ""
     tags = _drive_tags(repo)
-    if len(tags) >= 2:
-        previous = tags[-2][1]
-        first = _out(repo, "rev-list", f"{previous}..{ref}").split()
+    if tags:
+        # Everything after the previous drive's tag is the current drive. With
+        # only one tag left, which is what the ref looks like after a prune,
+        # that is the whole ref: over-retaining is the safe direction to be
+        # wrong in, and the alternative is cutting into the only drive on
+        # disk.
+        span = f"{tags[-2][1]}..{ref}" if len(tags) >= 2 else ref
+        first = _out(repo, "rev-list", span).split()
         floor = first[-1] if first else ""
         if floor and (not cut or _is_ancestor(repo, floor, cut)):
             cut = floor
@@ -399,7 +404,7 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
               and r not in ("refs/heads/main", "refs/heads/public")]
     for r in strays:
         report.append(f"  left alone, still holds dropped frames: {r}")
-    for name, n in _oversized(repo, cut, keeping, doomed):
+    for name, n in _oversized(repo, cut, keeping, doomed + strays):
         report.append(f"  outside retention, {n} commits of its own: {name}")
     if dry_run:
         report.append("dry run, nothing changed")

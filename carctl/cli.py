@@ -162,8 +162,11 @@ def cmd_lineage(args):
     n = _git("rev-list", "--count", lineagemod.REF).strip()
     print(f"{lineagemod.REF}  {n} promotion(s), kept indefinitely")
     print()
+    # One Promoted trailer per line. Run together on one line, a commit that
+    # moved four checkpoints at once reads as one very long checkpoint id.
     print(_git("log", f"-n{args.n}", "--format=%h  %ad  %s%n"
-               "            %(trailers:key=Promoted,valueonly,separator=%x20)"
+               "            %(trailers:key=Promoted,valueonly,"
+               "separator=%x0A            )"
                "%n            during %(trailers:key=Drive,valueonly)",
                "--date=format:%Y-%m-%d %H:%M", lineagemod.REF), end="")
 
