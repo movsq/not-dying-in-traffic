@@ -70,9 +70,9 @@ def cmd_incident(args):
     now = None
     for _ in range(int(args.seconds / 0.1)):
         f = plant.step()
-        inc = safety.detect(f, plant.true_light())
-        if inc and inc.kind == args.kind and hit is None:
-            hit = (f, inc)
+        for inc in safety.detect(f, plant.true_light()):
+            if inc.kind == args.kind and hit is None:
+                hit = (f, inc)
         if hit and f.seq == hit[0].seq + 8:
             now = f
             break

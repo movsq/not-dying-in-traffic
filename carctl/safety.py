@@ -47,21 +47,33 @@ class Incident:
         return OWNER.get(self.kind, "planner")
 
 
-def detect(f: Frame, true_light: str) -> Incident | None:
+def detect(f: Frame, true_light: str) -> list[Incident]:
+    """Every incident true of this frame, most severe first.
+
+    This used to return on the first match. `stop_line_crossed` is true for
+    exactly one tick, so a red-light run that coincided with any lidar or IMU
+    trigger was not merely deprioritised -- it was erased, with no later tick
+    able to catch it. blame.attribute() was then handed "controller" or
+    "prediction" instead of "perception", and the OTA-promoted checkpoint that
+    actually caused the run was never blamed. Several things can be wrong at
+    once, and a frame where two are wrong is not less interesting than one.
+    """
+    found = []
     if f.sensors.imu_accel_z > CURB_ACCEL_Z:
-        return Incident("curb_strike", f.seq,
-                        f"az={f.sensors.imu_accel_z:.1f} m/s^2")
+        found.append(Incident("curb_strike", f.seq,
+                              f"az={f.sensors.imu_accel_z:.1f} m/s^2"))
     if f.sensors.lidar_min_range < MIN_CLEARANCE:
-        return Incident("collision", f.seq,
-                        f"clearance={f.sensors.lidar_min_range:.2f} m")
+        found.append(Incident("collision", f.seq,
+                              f"clearance={f.sensors.lidar_min_range:.2f} m"))
     if true_light == "red" and f.sensors.stop_line_crossed and f.pose.v > 1.0:
-        return Incident("red_light_run", f.seq,
-                        f"crossed stop line at {f.pose.v * 3.6:.0f} km/h "
-                        f"while perception reported '{f.sensors.light_state}'")
+        found.append(Incident(
+            "red_light_run", f.seq,
+            f"crossed stop line at {f.pose.v * 3.6:.0f} km/h "
+            f"while perception reported '{f.sensors.light_state}'"))
     if abs(f.sensors.lateral_offset) > MAX_LAT_OFFSET:
-        return Incident("off_road", f.seq,
-                        f"lateral offset {f.sensors.lateral_offset:.2f} m")
-    return None
+        found.append(Incident("off_road", f.seq,
+                              f"lateral offset {f.sensors.lateral_offset:.2f} m"))
+    return found
 
 
 # ---------------------------------------------------------------------------

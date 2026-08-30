@@ -81,11 +81,11 @@ def _drive_forever() -> None:
             if STATE["halted"]:
                 break
             f = plant.step()
-            inc = safety.detect(f, plant.true_light())
-            if inc and inc.kind in latched:
-                inc = None
-            elif inc:
-                latched.add(inc.kind)
+            fresh = [i for i in safety.detect(f, plant.true_light())
+                     if i.kind not in latched]
+            for i in fresh:
+                latched.add(i.kind)
+            inc = fresh[0] if fresh else None
             if f.reversible:
                 STATE["last_good_seq"] = f.seq
             _broadcast({

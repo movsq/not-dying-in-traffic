@@ -88,12 +88,14 @@ def drive(repo: str, seconds: float, realtime: bool = True,
 
             # Safety runs before the commit. The record must never be the
             # thing standing between a hazard and the brakes.
-            inc = safety.detect(frame, plant.true_light())
-            if inc and inc.kind in latched:
-                inc = None                  # same event, still unfolding
-            elif inc:
-                latched.add(inc.kind)
-                rep.incidents.append(inc)
+            fresh = [i for i in safety.detect(frame, plant.true_light())
+                     if i.kind not in latched]
+            for i in fresh:                 # a repeat kind is the same event
+                latched.add(i.kind)         # still unfolding, not a new one
+                rep.incidents.append(i)
+            # on_frame still takes a single incident: the most severe one that
+            # is new this tick, or None.
+            inc = fresh[0] if fresh else None
 
             t0 = time.perf_counter()
             committer.submit(frame)
