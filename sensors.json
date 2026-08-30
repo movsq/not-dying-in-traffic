@@ -5,7 +5,7 @@
  "lidar_min_bearing": 0.0,
  "lidar_min_range": 40.0,
  "lidar_min_range_rear": 40.0,
- "light_distance": 100.0,
+ "light_distance": 75.0,
  "light_state": "green",
  "stop_line_crossed": false,
  "wheel_slip": 0.02
