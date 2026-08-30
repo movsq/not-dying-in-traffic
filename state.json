@@ -2,13 +2,13 @@
  "maneuver": "lane_change_right",
  "pose": {
   "heading": 1.1,
-  "steer": -0.1,
+  "steer": -0.0,
   "v": 11.9,
   "x": 50.0,
   "y": 50.0
  },
  "reversible": true,
  "road": "Je\u010dn\u00e1",
- "seq": 95,
+ "seq": 96,
  "t_mono_ns": 0
 }
