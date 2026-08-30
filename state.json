@@ -1,14 +1,14 @@
 {
  "maneuver": "cruise",
  "pose": {
-  "heading": 1.6,
-  "steer": -0.1,
-  "v": 7.1,
-  "x": 50.0,
-  "y": 25.0
+  "heading": 0.0,
+  "steer": 0.0,
+  "v": 13.9,
+  "x": 0.0,
+  "y": 0.0
  },
  "reversible": true,
- "road": "Je\u010dn\u00e1",
- "seq": 59,
+ "road": "Vinohradsk\u00e1",
+ "seq": 0,
  "t_mono_ns": 0
 }
