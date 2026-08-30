@@ -55,7 +55,7 @@ class ParkingStash:
 
     def _git(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["git", *args], cwd=self.repo,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, encoding="utf-8")
 
     def push(self, f: Frame, pre: Preconditions, attempt: int = 1) -> StashEntry:
         """Save the pose we can return to, and the facts we are betting on."""
@@ -75,7 +75,7 @@ class ParkingStash:
     def _git_hash(self, text: str) -> str:
         p = subprocess.run(["git", "hash-object", "-w", "--stdin"],
                            cwd=self.repo, input=text, capture_output=True,
-                           text=True)
+                           text=True, encoding="utf-8")
         return p.stdout.strip()
 
     def list(self) -> list[StashEntry]:

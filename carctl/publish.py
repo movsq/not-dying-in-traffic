@@ -128,8 +128,7 @@ def build_public_ref(repo: str, src: str = "refs/heads/main",
     if r.returncode != 0:
         raise RuntimeError(r.stderr.decode("utf-8", "replace")[:2000])
     return subprocess.run(["git", "rev-parse", dst], cwd=repo,
-                          capture_output=True, text=True,
-                          encoding="utf-8").stdout.strip()
+                          capture_output=True, text=True, encoding="utf-8").stdout.strip()
 
 
 def audit(repo: str, ref: str = "refs/heads/public") -> list[str]:
@@ -143,8 +142,7 @@ def audit(repo: str, ref: str = "refs/heads/public") -> list[str]:
         if who.encode() != PUBLIC_IDENT:
             problems.append(f"identity {who!r} is not the public identity")
     bodies = subprocess.run(["git", "log", "--format=%B", ref], cwd=repo,
-                            capture_output=True, text=True,
-                            encoding="utf-8").stdout
+                            capture_output=True, text=True, encoding="utf-8").stdout
     for m in re.finditer(r"^Pose: (-?[\d.]+),(-?[\d.]+)", bodies, re.M):
         x, y = float(m.group(1)), float(m.group(2))
         if x != _snap(x) or y != _snap(y):

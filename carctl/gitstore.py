@@ -68,7 +68,7 @@ class Committer:
         # them.
         existing = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", self.ref.decode()],
-            cwd=self.repo, capture_output=True, text=True)
+            cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
         self._need_from = existing.returncode == 0
         self._proc = subprocess.Popen(
             ["git", "fast-import", "--date-format=raw", "--quiet", "--done"],

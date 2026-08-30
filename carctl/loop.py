@@ -30,7 +30,7 @@ def _tag_drive(repo: str) -> None:
     on drive boundaries, not on some arbitrary frame in the middle of one."""
     existing = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
                                "refs/tags/drive-*"], cwd=repo,
-                              capture_output=True, text=True).stdout.split()
+                              capture_output=True, text=True, encoding="utf-8").stdout.split()
     n = len(existing) + 1
     subprocess.run(["git", "tag", f"drive-{n:04d}", "refs/heads/main"],
                    cwd=repo, capture_output=True)

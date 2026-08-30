@@ -104,7 +104,7 @@ def physical_revert(repo: str, sha: str, now: Frame) -> RevertVerdict:
     """Evaluate reverting `sha` physically. Does not touch the repo."""
     parent_state = subprocess.run(
         ["git", "show", f"{sha}^:state.json"], cwd=repo,
-        capture_output=True, text=True)
+        capture_output=True, text=True, encoding="utf-8")
     if parent_state.returncode != 0:
         return RevertVerdict(False, "no parent commit to revert to")
     return reachable(now, json.loads(parent_state.stdout))
@@ -114,21 +114,21 @@ def record_revert(repo: str, sha: str, worktree: str, note: str) -> str:
     """The record-plane half. Runs in a detached control worktree so it can
     never race the fast-import stream writing to refs/heads/main."""
     subprocess.run(["git", "worktree", "add", "--detach", "-f", worktree, sha],
-                   cwd=repo, capture_output=True, text=True)
+                   cwd=repo, capture_output=True, text=True, encoding="utf-8")
     r = subprocess.run(
         ["git", "revert", "--no-edit", "-n", sha],
-        cwd=worktree, capture_output=True, text=True)
+        cwd=worktree, capture_output=True, text=True, encoding="utf-8")
     if r.returncode != 0:
         return f"record revert conflicted: {r.stderr.strip()[:300]}"
     subprocess.run(["git", "commit", "-m",
                     f'revert: "{_subject(repo, sha)}"\n\n{note}\n\n'
                     f"This reverts commit {sha}."],
-                   cwd=worktree, capture_output=True, text=True)
+                   cwd=worktree, capture_output=True, text=True, encoding="utf-8")
     out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding="utf-8")
     return out.stdout.strip()
 
 
 def _subject(repo: str, sha: str) -> str:
     return subprocess.run(["git", "log", "-1", "--format=%s", sha], cwd=repo,
-                          capture_output=True, text=True).stdout.strip()
+                          capture_output=True, text=True, encoding="utf-8").stdout.strip()

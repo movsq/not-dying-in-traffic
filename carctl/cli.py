@@ -8,7 +8,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _git(*a):
-    return subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True).stdout
+    return subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True, encoding="utf-8").stdout
 
 
 def cmd_drive(args):
@@ -151,6 +151,13 @@ def cmd_log(args):
 
 
 def main(argv=None):
+    # Street names are UTF-8. A cp1252 console would otherwise raise
+    # UnicodeEncodeError mid-report.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(prog="carctl")
     sub = p.add_subparsers(dest="cmd", required=True)
 

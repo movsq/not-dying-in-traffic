@@ -11,7 +11,7 @@ import json, subprocess, pathlib
 
 def _git(repo: str, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True,
-                          text=True).stdout
+                          text=True, encoding="utf-8").stdout
 
 
 def line_of(repo: str, sha: str, subsystem: str) -> int | None:
