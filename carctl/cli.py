@@ -24,6 +24,7 @@ def cmd_drive(args):
     print(f"deadline overruns {rep.overruns}")
     print(f"max jitter      {rep.max_jitter_ms:.2f} ms")
     print(f"max submit cost {rep.max_submit_us:.1f} us   <- the loop's entire git bill")
+    print(f"tagged as      {rep.tag or 'UNTAGGED'}")
     kinds = {}
     for i in rep.incidents:
         kinds.setdefault(i.kind, []).append(i)
@@ -35,15 +36,10 @@ def cmd_drive(args):
 
 def cmd_incident(args):
     """Full incident walk-through: find it, blame it, decide the revert."""
-    sha = _git("log", "--format=%H %s", "-n", "400").splitlines()
-    target = None
-    for line in sha:
-        h, _, subj = line.partition(" ")
-        if args.kind == "red_light_run" and "Hlavní" in subj:
-            target = h
     # Re-run the drive deterministically to recover the frame + incident.
     plant = Plant()
     hit = None
+    now = None
     for _ in range(int(args.seconds / 0.1)):
         f = plant.step()
         inc = safety.detect(f, plant.true_light())

@@ -20,7 +20,7 @@ Two consequences worth knowing about:
     reported; a drop is a defect, not a normal condition.
 """
 from __future__ import annotations
-import queue, subprocess, threading, os
+import queue, subprocess, tempfile, threading
 from .state import Frame
 from . import msgen
 
@@ -44,6 +44,9 @@ class Committer:
         self.dropped = 0
         self.committed = 0
         self._need_from = False
+        self.error: Exception | None = None
+        self._alive = True
+        self._stderr = None
         self._thread: threading.Thread | None = None
         self._proc: subprocess.Popen | None = None
 
@@ -70,10 +73,16 @@ class Committer:
             ["git", "rev-parse", "--verify", "--quiet", self.ref.decode()],
             cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
         self._need_from = existing.returncode == 0
+        # stderr goes to a file, not a pipe. Nothing reads a pipe until
+        # communicate() at the very end, so a few hundred warning lines fill
+        # the OS buffer, fast-import blocks writing stderr, stops reading
+        # stdin, and the committer thread blocks writing to it. Deadlock at
+        # the end of a drive, with the loop already finished.
+        self._stderr = tempfile.TemporaryFile()
         self._proc = subprocess.Popen(
             ["git", "fast-import", "--date-format=raw", "--quiet", "--done"],
             cwd=self.repo, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=self._stderr,
         )
         self._thread = threading.Thread(target=self._drain, daemon=True)
         self._thread.start()
@@ -97,26 +106,56 @@ class Committer:
         assert self._proc and self._proc.stdin
         stdin = self._proc.stdin
         since_ckpt = 0
-        while True:
-            f = self.q.get()
-            if f is None:
-                break
-            stdin.write(self._emit(f))
-            self.committed += 1
-            since_ckpt += 1
-            if since_ckpt >= CHECKPOINT_EVERY:
-                stdin.write(b"checkpoint\n")
-                since_ckpt = 0
+        try:
+            while True:
+                f = self.q.get()
+                if f is None:
+                    break
+                stdin.write(self._emit(f))
+                self.committed += 1
+                since_ckpt += 1
+                if since_ckpt >= CHECKPOINT_EVERY:
+                    stdin.write(b"checkpoint\n")
+                    since_ckpt = 0
+                stdin.flush()
+            stdin.write(b"done\n")
             stdin.flush()
-        stdin.write(b"done\n")
-        stdin.flush()
-        stdin.close()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            # fast-import died under us. Record it and let stop() report it
+            # rather than dying silently and leaving the queue to fill.
+            self.error = exc
+        finally:
+            self._alive = False
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
+    def _stderr_text(self) -> str:
+        if not self._stderr:
+            return ""
+        self._stderr.seek(0)
+        return self._stderr.read().decode("utf-8", "replace")[:2000]
 
     def stop(self) -> None:
-        self.q.put(None)
+        # A blocking put here hangs forever if the drain thread already died
+        # and left the queue full. The sentinel is best effort; the thread is
+        # joined with a timeout either way.
+        if self._alive:
+            try:
+                self.q.put(None, timeout=5)
+            except queue.Full:
+                pass
         if self._thread:
             self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                raise RuntimeError("committer thread did not finish in 30 s; "
+                                   f"{self.q.qsize()} frames still queued")
         if self._proc:
-            _, err = self._proc.communicate(timeout=30)
-            if self._proc.returncode != 0:
-                raise RuntimeError(f"fast-import failed: {err.decode()[:2000]}")
+            self._proc.wait(timeout=30)
+            if self._proc.returncode != 0 or self.error:
+                raise RuntimeError(
+                    f"fast-import failed ({self.error or 'exit '}"
+                    f"{self._proc.returncode}): {self._stderr_text()}")
+        if self._stderr:
+            self._stderr.close()

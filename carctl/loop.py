@@ -23,17 +23,32 @@ class DriveReport:
     incidents: list = field(default_factory=list)
     dropped: int = 0
     committed: int = 0
+    tag: str = ""
 
 
-def _tag_drive(repo: str) -> None:
+def _tag_drive(repo: str) -> str:
     """One lightweight tag per drive. Bisecting a fleet history means landing
     on drive boundaries, not on some arbitrary frame in the middle of one."""
     existing = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
                                "refs/tags/drive-*"], cwd=repo,
-                              capture_output=True, text=True, encoding="utf-8").stdout.split()
-    n = len(existing) + 1
-    subprocess.run(["git", "tag", f"drive-{n:04d}", "refs/heads/main"],
-                   cwd=repo, capture_output=True)
+                              capture_output=True, text=True,
+                              encoding="utf-8").stdout.split()
+    # High-water mark, not a count. Counting reuses a number as soon as any
+    # tag is deleted, so drive-0002 could end up pointing at a tip thousands
+    # of commits after drive-0003 and tag order would stop matching drive
+    # order, which is exactly what cmd_bisect reads to pick its endpoints.
+    nums = [int(t.rsplit("-", 1)[-1]) for t in existing
+            if t.rsplit("-", 1)[-1].isdigit()]
+    n = max(nums, default=0) + 1
+    name = f"drive-{n:04d}"
+    r = subprocess.run(["git", "tag", name, "refs/heads/main"], cwd=repo,
+                       capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        # Swallowing this left drives silently unbounded for bisect.
+        print(f"warning: could not tag this drive as {name}: "
+              f"{r.stderr.strip()}")
+        return ""
+    return name
 
 
 def drive(repo: str, seconds: float, realtime: bool = True,
@@ -78,7 +93,7 @@ def drive(repo: str, seconds: float, realtime: bool = True,
             on_frame(frame, inc)
 
     committer.stop()
-    _tag_drive(repo)
+    rep.tag = _tag_drive(repo)
     rep.dropped = committer.dropped
     rep.committed = committer.committed
     return rep
