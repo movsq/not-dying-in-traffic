@@ -2,13 +2,13 @@
  "maneuver": "turn_left",
  "pose": {
   "heading": 1.6,
-  "steer": 0.3,
+  "steer": 0.2,
   "v": 5.6,
   "x": 50.0,
   "y": 0.0
  },
  "reversible": true,
  "road": "Je\u010dn\u00e1",
- "seq": 50,
+ "seq": 51,
  "t_mono_ns": 0
 }
