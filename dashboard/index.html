@@ -74,6 +74,10 @@
   <section class="full">
     <h2>Rollback</h2>
     <button class="danger" id="btn">git revert --hard</button>
+    <button class="no" id="resume" style="margin-top:10px;padding:6px 12px;
+      border-radius:6px;font:13px var(--mono);background:transparent;
+      color:var(--fg);border:1px solid var(--line);cursor:pointer" hidden>
+      resume driving</button>
     <div class="hint" id="hint">
       Reverts the record to the last commit marked reversible and brings the
       vehicle to a controlled stop. Frames already committed to the world are
@@ -137,13 +141,22 @@ $('btn').onclick = () => {
   $('dlg').showModal();
 };
 $('no').onclick  = () => $('dlg').close();
+const TOKEN = '__REVERT_TOKEN__';   // minted per server start, served only here
+
 $('yes').onclick = async () => {
   $('dlg').close();
-  const r = await fetch('/revert-hard', {method:'POST'});
+  const r = await fetch('/revert-hard',
+    {method:'POST', headers:{'X-Revert-Token': TOKEN}});
   halt(JSON.stringify(await r.json()));
 };
 
+$('resume').onclick = async () => {
+  await fetch('/resume', {method:'POST', headers:{'X-Revert-Token': TOKEN}});
+  location.reload();
+};
+
 function halt(note) {
+  $('resume').hidden = false;
   $('conn').textContent = 'HALTED';
   $('btn').disabled = true;
   $('btn').textContent = 'reverted — record frozen';
