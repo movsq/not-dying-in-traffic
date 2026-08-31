@@ -55,19 +55,16 @@ WINDOW_ENV = "CARCTL_WINDOW_DAYS"
 # km/h. Below this the wheels are not turning and maintenance may run.
 STATIONARY_KMH = 1.0
 LOCK_NAME = "carctl-drive.lock"
-# Grace on the declared end of a drive before its lock stops counting. A drive
-# knows its own length up front, so the lock can expire by itself: a power cut
-# mid-drive must not leave a file behind that blocks maintenance forever on a
-# vehicle with nobody in it.
+# Grace on the end of a lock's lease before it stops counting. The lock
+# expires by itself so that a power cut mid-drive cannot leave a file behind
+# that blocks maintenance forever on a vehicle with nobody in it; the grace is
+# what keeps a renewal that is a few seconds late from briefly unlocking a
+# drive that is still running.
 LOCK_GRACE_S = 60.0
-# Ceiling on how far ahead a lock may claim the disk, whatever it declares. A
-# typo'd `--seconds 1e9` plus a crash otherwise blocks every maintenance pass
-# until 2058, on a vehicle nobody is sitting in, and the record plane must not
-# be able to lock itself out of its own housekeeping on one bad digit. Four
-# hours is longer than any drive this thing does; a genuinely longer one is
-# still covered, because stationary() reads the last frame's speed as a second
-# and independent signal and a moving car fails that gate on its own.
-LOCK_MAX_S = 4 * 3600.0
+# How far ahead a single write of the lock may claim the disk. Not a ceiling
+# on the drive -- a lease, renewed by the loop for as long as the drive is
+# actually running. See drive_lock.
+LOCK_LEASE_S = 900.0
 # `git repack --geometric` landed in 2.32. Everything else here works on the
 # git that ships with a 2020 distribution, so this is the one version gate,
 # and it degrades rather than refusing.
@@ -115,39 +112,85 @@ def lock_path(repo: str) -> str:
 
 @contextlib.contextmanager
 def drive_lock(repo: str, seconds: float):
-    """Advertise a drive in progress, for the length it says it will take.
+    """Advertise a drive in progress. Yields a zero-argument refresh().
 
     Advisory in one direction only. It tells maintenance to stay off the disk;
     it never stops a drive from starting. The record plane must not be able to
     stand between an operator and the vehicle moving, and a lock left behind
     by a crash would do exactly that.
+
+    A LEASE, not a duration. Each write claims the disk for at most
+    LOCK_LEASE_S, and the loop calls refresh() to extend it for as long as the
+    drive is genuinely still running. That replaces two designs, both wrong in
+    opposite directions:
+
+      * Honouring `seconds` outright meant a typo'd `--seconds 1e9` plus a
+        crash blocked every maintenance pass until 2058, on a vehicle with
+        nobody in it. The record plane must not be able to lock itself out of
+        its own housekeeping on one bad digit.
+      * Capping it at four hours -- "longer than any drive this thing does" --
+        re-created the hole the review found. A drive longer than the cap is
+        not protected by the lock any more, and the second gate does not cover
+        it: stationary() reads the last frame's SPEED, and a car sitting at a
+        red light reports 0 km/h while fast-import is very much live. That is
+        a full repack starting under a running drive, which is exactly the
+        stalled-disk scenario the bounded queue exists to survive.
+
+    A lease is strictly better than both. Any drive length is protected, for
+    as long as it keeps saying so, and a crash frees maintenance within
+    LOCK_LEASE_S + LOCK_GRACE_S -- about sixteen minutes -- instead of hours.
+    Liveness is proven by the drive still running rather than promised up
+    front by a number typed at a prompt.
+
+    `seconds` is still what the drive declared and still goes in the file as
+    written: drive_in_progress reports it, and the two numbers disagreeing is
+    the honest reading -- this is what you asked for, this is how long we will
+    hold the disk before you have to say so again.
     """
     path = lock_path(repo)
-    # `seconds` is what the drive declared and stays in the file as written --
-    # drive_in_progress reports it and old locks carry it -- but the horizon it
-    # buys is capped. The two numbers disagreeing is the honest reading: this
-    # is what you asked for, this is how long we will hold the disk for it.
     token = uuid.uuid4().hex
-    body = json.dumps({"pid": os.getpid(),
-                       "until": time.time() + min(seconds, LOCK_MAX_S)
-                                + LOCK_GRACE_S,
-                       "seconds": seconds,
-                       # Additive. drive_in_progress reads pid/until/seconds
-                       # and never looks here, so a lock written by an older
-                       # build still reads and still blocks correctly.
-                       "token": token})
-    try:
+
+    def _write() -> None:
+        body = json.dumps({"pid": os.getpid(),
+                           "until": time.time() + min(seconds, LOCK_LEASE_S)
+                                    + LOCK_GRACE_S,
+                           "seconds": seconds,
+                           # Additive, and the same token on every renewal:
+                           # a refresh extends OUR lease and must never look
+                           # like a different drive taking the file over.
+                           # drive_in_progress reads pid/until/seconds and
+                           # never looks here, so a lock written by an older
+                           # build still reads and still blocks correctly.
+                           "token": token})
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(body + "\n")
+
+    try:
+        _write()
+        held = True
     except OSError:
         # A drive that cannot write its lock still drives. Maintenance is
         # gated on the vehicle being stopped as well, so this degrades to one
         # gate rather than none.
-        path = ""
+        held = False
+
+    def refresh() -> None:
+        """Extend the lease. Called from the loop; never raises.
+
+        A drive is not going to be interrupted because the housekeeping hint
+        could not be rewritten -- and if the initial write failed there is no
+        lock of ours to extend, so this is a no-op rather than a first write
+        appearing mid-drive from a path that already degraded to one gate.
+        """
+        if not held:
+            return
+        with contextlib.suppress(OSError):
+            _write()
+
     try:
-        yield
+        yield refresh
     finally:
-        if path:
+        if held:
             _release_lock(path, token)
 
 

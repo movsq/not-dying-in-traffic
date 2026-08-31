@@ -40,8 +40,24 @@ IRREVERSIBLE_CLEARANCE = 2.0   # m; closer than this and the frame is one-way
 PARK_CLEARANCE = 0.5    # m
 
 # A near miss is a kinematic event: it is about closing speed, not about
-# proximity. A stationary car is not colliding with anything, however close it
-# is parked, and there is no manoeuvre for it to have got wrong.
+# proximity, and closing speed is what this constant finally measures --
+# nearest-return delta over the frames' own clock, which is an approach rate
+# whether the ego is the thing moving or not.
+#
+# Ego speed alone was standing in for it, and it blinded the detector in two
+# directions at once. A parallel park closes on the car behind at a crawl, so
+# a 0.3 m/s creep straight through PARK_CLEARANCE fired nothing: the 0.5 m
+# floor was unreachable at the speeds parks actually happen at, which is the
+# only regime it was ever written for. And a stationary ego being closed on by
+# somebody else was silent for the same reason -- the gate asked the one car
+# in the scene that was not moving.
+COLLISION_CLOSING_SPEED = 0.2   # m/s of range being eaten
+
+# The ego-speed arm is kept as the other half of an OR, not replaced. Matching
+# another vehicle's speed inside the clearance eats no range at all -- closing
+# is ~0 while the gap stays dangerous -- so following at speed has to keep
+# counting, and the recorded seq 108/109 pair is exactly that frame: drop this
+# arm and those two stop meaning what they have always meant.
 #
 # The same 1.0 m/s red_light_run already uses as its floor for "moving",
 # deliberately: two different answers to "is this car in motion" inside one
@@ -82,8 +98,14 @@ class Incident:
         return OWNER.get(self.kind, "planner")
 
 
-def detect(f: Frame, true_light: str) -> list[Incident]:
+def detect(f: Frame, true_light: str, prev: Frame | None = None) -> list[Incident]:
     """Every incident true of this frame, most severe first, by SEVERITY.
+
+    `prev` is the frame one tick back, or None on the first tick of a run. It
+    is the only way to know a range is shrinking: a single frame carries a
+    distance, and no single distance is an approach. Callers that cannot
+    supply it get the old ego-speed-only collision gate, which is a weaker
+    detector rather than a broken one.
 
     "Most severe first" used to describe the order the checks happen to be
     written in, which is not a ranking of anything; sorting is what makes the
@@ -109,16 +131,33 @@ def detect(f: Frame, true_light: str) -> list[Incident]:
     # 139, doing 2.47 m/s), so nothing in this scenario can reach 0.5 m and
     # the constant has never once fired here.
     #
-    # What that leaves is the frames around a park, which are not park frames
-    # themselves and so take the road limit. Those are gated on motion
-    # below: the car FINISHES parking and then sits 1.40 m off the van it
-    # deliberately parked behind, and the 1.5 m road limit called each of
-    # those still frames a collision -- 21 consecutive phantom incidents, all
-    # of them charged to prediction, and invisible in a report that lists one
-    # line per kind.
-    limit = PARK_CLEARANCE if f.maneuver == "park" else MIN_CLEARANCE
+    # Which floor applies is decided by lane_ref, not by the manoeuvre label.
+    # An empty lane_ref means the planner deliberately left the lane
+    # reference, and that emptiness already suspends off_road below for
+    # exactly this reason: proximity is the job out there, not a fault. The
+    # manoeuvre label got it wrong twice on the same van. The car FINISHES
+    # parking, the script rolls over to "stop", and the settling frames --
+    # still creeping the last half-metre toward the bay van, inside 1.5 m --
+    # took the road limit: first as 21 stationary phantoms, then, once the
+    # closing-speed arm below existed, as a phantom at seq 149 for closing on
+    # a van it was deliberately parking behind. The same signal, one decision:
+    # off the lane reference on purpose, judged by the parking floor.
+    limit = MIN_CLEARANCE if f.sensors.lane_ref else PARK_CLEARANCE
+    # Measured over the frames' own clock, not over an assumed DT. A tick that
+    # overran, or a caller stepping the plant at its own rate, would otherwise
+    # be handed a fabricated approach rate computed from a period that did not
+    # happen. A dt of zero or less means the clock did not advance -- a
+    # repeated or reordered frame -- and there is no rate to be had from it,
+    # so that reads as "no previous frame" rather than as a division.
+    closing = 0.0
+    if prev is not None:
+        dt = (f.t_mono_ns - prev.t_mono_ns) / 1e9
+        if dt > 0:
+            closing = (prev.sensors.lidar_min_range
+                       - f.sensors.lidar_min_range) / dt
     if (f.sensors.lidar_min_range < limit
-            and f.pose.v > COLLISION_MIN_SPEED):
+            and (closing > COLLISION_CLOSING_SPEED
+                 or f.pose.v > COLLISION_MIN_SPEED)):
         found.append(Incident("collision", f.seq,
                               f"clearance={f.sensors.lidar_min_range:.2f} m"))
     if true_light == "red" and f.sensors.stop_line_crossed and f.pose.v > 1.0:

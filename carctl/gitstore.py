@@ -27,8 +27,8 @@ retention window and that ref does not, so once main is pruned the lineage ref
 is the only surviving record of when a model shipped. See lineage.py.
 """
 from __future__ import annotations
-import os, queue, subprocess, tempfile, threading, time
-from .state import Frame
+import contextlib, os, queue, subprocess, tempfile, threading, time
+from .state import Frame, FRAME_PATHS
 from . import lineage, msgen
 from .publish import PUBLIC_IDENT
 
@@ -37,11 +37,10 @@ QUEUE_DEPTH = 512       # frames, about 51 s of backlog before we start dropping
 
 IDENT = b"not-dying-in-traffic <vsedlacek1337@gmail.com>"
 
-# Exactly what a frame commit's tree is allowed to contain -- Frame.tree()'s
-# keys, restated here because this is the side that has to recognise a tree
-# somebody else wrote.
-FRAME_PATHS = frozenset(("state.json", "sensors.json", "actuators.json",
-                         "models.json"))
+# FRAME_PATHS is imported, not restated. This is the side that has to
+# recognise a tree somebody else wrote, and it used to carry its own copy of
+# the four names: the writer and the checker held the same fact twice, which
+# is the same fact only until one of them is edited.
 
 
 def _data(payload: bytes) -> bytes:
@@ -109,19 +108,51 @@ class Committer:
             except queue.Full:
                 self.dropped += 1        # refilled again; this frame is lost
 
+    def abandon(self) -> None:
+        """Kill the fast-import child, now, without waiting for anything.
+
+        stop() is the orderly path and it can spend a minute in joins. This is
+        for the caller who has already decided not to wait -- loop.py's second
+        Ctrl-C. Killing the child rather than simply walking away is the same
+        reasoning stop()'s own timeout paths use: an orphaned fast-import holds
+        a half-written pack open, and on Windows an open pack is an unlinkable
+        one, so the next `carctl maintain` fails its repack for a reason that
+        has nothing to do with maintenance.
+        """
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+
     # ---- committer-thread side ---------------------------------------------
+    def _rev(self, ref: str) -> str:
+        """The sha `ref` resolves to in this repo, or "" if it does not.
+
+        Three copies of this incantation lived inline, each spelled slightly
+        differently and each reading its answer out of a different field --
+        returncode in one place, stdout in another. They all mean the same
+        thing, and the two questions they decide (root a new ref, or continue
+        an existing one) are the ones where getting the polarity backwards
+        orphans every commit already on the ref.
+        """
+        return subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref], cwd=self.repo,
+            capture_output=True, text=True, encoding="utf-8").stdout.strip()
+
     def _check_frame_tree(self) -> None:
         """Refuse to append frames onto a tip that is not a frame.
 
-        _emit writes `from <ref>^0` and no `deleteall`, so fast-import
-        inherits the parent commit's entire tree and the frame's four files
-        are only overlaid on top of it. Driving in a repo with the source
-        checked into main -- the easy mistake, because that is the branch this
-        package is developed on -- therefore stamped carctl/, README.md and
-        the rest into every single frame commit: source and record fused into
-        one tree, which is the exact mixing the Source section exists to
-        prevent. Nothing detects it afterwards either, so the check has to
-        happen before the first commit rather than after the drive.
+        _emit now writes `deleteall`, so a polluted tip can no longer ride
+        forward into the frames appended to it -- but that makes this check
+        more useful, not redundant. Driving in a repo with the source checked
+        into main is the easy mistake, because that is the branch this package
+        is developed on, and the two possible answers to it are "bury the
+        source under 170 frame commits and say nothing" or "refuse and say
+        which repo you are in". Silently burying it is the worse one: the
+        commits are indistinguishable from a real drive's afterwards, and the
+        operator learns nothing about having run the command in the wrong
+        place. Before the first commit rather than after the drive, because
+        after the drive the damage is the history.
         """
         r = subprocess.run(["git", "ls-tree", "--name-only", self.ref.decode()],
                            cwd=self.repo, capture_output=True, text=True,
@@ -129,8 +160,8 @@ class Committer:
         if r.returncode != 0:
             raise RuntimeError(f"cannot read the tree at {self.ref.decode()}: "
                                f"{r.stderr.strip()}")
-        extra = sorted({n.strip() for n in r.stdout.splitlines() if n.strip()}
-                       - FRAME_PATHS)
+        extra = sorted({n.strip() for n in r.stdout.splitlines()
+                        if n.strip()}.difference(FRAME_PATHS))
         if extra:
             shown = ", ".join(extra[:6]) + (", ..." if len(extra) > 6 else "")
             raise RuntimeError(
@@ -154,16 +185,36 @@ class Committer:
         to outlive it.
         """
         local = self.lineage_ref.decode()
-        if subprocess.run(["git", "rev-parse", "--verify", "--quiet", local],
-                          cwd=self.repo, capture_output=True).returncode == 0:
+        if self._rev(local):
             return
-        upstream = "refs/remotes/origin/" + local.rsplit("/", 1)[-1]
-        r = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", upstream],
-            cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
-        if r.returncode != 0:
-            return          # nothing published to continue; root one below
-        seed = subprocess.run(["git", "update-ref", local, r.stdout.strip()],
+        # `refs/remotes/origin/lineage` was hardcoded here, which made the
+        # remote's NAME load-bearing: the review's point is that a clone whose
+        # remote is called `upstream`, or `fleet`, found nothing to continue
+        # and quietly rooted a lineage parallel to the published one -- the
+        # exact failure this method exists to prevent, reintroduced by a
+        # spelling. Ask lineage which remote refs actually resolve instead.
+        candidates = lineage.remote_refs(self.repo)
+        name = local.rsplit("/", 1)[-1]
+        origin = f"refs/remotes/origin/{name}"
+        if origin in candidates:
+            # Still preferred when it is there. `origin` is what a clone calls
+            # the place it came from, and a repo with several remotes has an
+            # answer to "whose lineage is this" that guessing does not.
+            upstream = origin
+        elif len(candidates) == 1:
+            upstream = candidates[0]
+        else:
+            # None of them, or several with no origin among them. Neither is a
+            # published lineage this drive can be sure it is continuing, and
+            # picking one at random is how a renamed remote roots the parallel
+            # lineage in the first place. Say so and root a local one, which is
+            # at least visibly a new lineage rather than a silent fork.
+            print(f"warning: no published lineage was found to continue "
+                  f"({len(candidates)} remote lineage ref(s) resolve, none of "
+                  f"them unambiguous); this drive's promotions will start a "
+                  f"lineage of their own")
+            return
+        seed = subprocess.run(["git", "update-ref", local, self._rev(upstream)],
                               cwd=self.repo, capture_output=True, text=True,
                               encoding="utf-8")
         if seed.returncode != 0:
@@ -179,10 +230,7 @@ class Committer:
         # commit, which loses every previous drive. Continue the existing tip
         # explicitly so drives append into one history and bisect works across
         # them.
-        existing = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", self.ref.decode()],
-            cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
-        self._need_from = existing.returncode == 0
+        self._need_from = bool(self._rev(self.ref.decode()))
         if self._need_from:
             self._check_frame_tree()
         # Before models_at, not after: what the local ref says is the whole
@@ -234,6 +282,17 @@ class Committer:
             self._need_from = False
         # After the first, no `from` line. fast-import parents each commit on
         # the head it is already tracking, which is the linear history we want.
+        #
+        # `deleteall` before the M lines, so the tree of a frame commit is
+        # equal to Frame.tree() by construction instead of by inheritance.
+        # Without it fast-import starts each commit from the parent's tree and
+        # merely overlays the four files, so anything sitting below the tip --
+        # a source checkout, a file some other tool wrote, a path a previous
+        # version of this code emitted -- rides forward into every frame of
+        # every drive from here on, invisibly, because no frame ever mentions
+        # it. _check_frame_tree still refuses such a tip up front: this makes
+        # the pollution unable to spread, not acceptable.
+        out.append(b"deleteall\n")
         for path, content in f.tree().items():
             out.append(b"M 100644 inline " + path.encode() + b"\n")
             out.append(_data(content.encode()))
@@ -267,6 +326,12 @@ class Committer:
             # vehicle has ever recorded.
             out.append(b"from " + self.lineage_ref + b"^0\n")
             self._lineage_from = False
+        # "models.json and nothing else" is the docstring's claim, and this is
+        # what makes it true of the tree rather than only of the M line below.
+        # Inheriting the parent's tree would have let anything that ever
+        # reached this ref -- backfill's output, a hand-made commit -- stay on
+        # it forever, on the one ref that is published and then kept for good.
+        out.append(b"deleteall\n")
         out.append(b"M 100644 inline models.json\n")
         out.append(_data(models.encode()))
         out.append(b"\n")

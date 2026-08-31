@@ -23,14 +23,74 @@ forever, and main is pruned partly because a permanent record of where the car
 was is the thing we are trying not to have.
 """
 from __future__ import annotations
-import datetime, json, subprocess
+import datetime, json, re, subprocess
 
 REF = "refs/heads/lineage"
+
+# The value half of `Drive: drive-0006`, as message() writes it. `(untagged)`
+# is the other value this trailer takes and it deliberately does not match.
+_DRIVE_NUM = re.compile(r"^drive-(\d+)$")
 
 
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True,
                           text=True, encoding="utf-8")
+
+
+def remote_refs(repo: str, ref: str = REF) -> list[str]:
+    """Every remote-tracking copy of this ref that currently resolves.
+
+    Full refnames, `refs/remotes/<remote>/<basename>`. One `origin` hardcoded
+    into the caller was the bug: a vehicle that fetches from a second remote,
+    or from one named anything else, silently learned nothing from it -- and
+    what is read off these refs is the drive counter, where learning nothing
+    means reusing a number on a ref that is never pruned.
+
+    The glob is deliberate. for-each-ref matches with fnmatch, whose `*` does
+    not cross `/`, so `refs/remotes/*/lineage` is exactly "one remote name,
+    then the basename" -- it picks up `refs/remotes/upstream/lineage` and does
+    not wander into `refs/remotes/origin/wip/lineage`, which is somebody's
+    topic branch and not a copy of this ref. for-each-ref also only ever lists
+    refs that resolve, so the caller does not have to check.
+    """
+    r = _git(repo, "for-each-ref", "--format=%(refname)",
+             "refs/remotes/*/" + ref.rsplit("/", 1)[-1])
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def high_water_drive(repo: str, ref: str = REF) -> int:
+    """The largest drive number named by a promotion on this ref or any
+    remote-tracking copy of it, or 0 if none of them say.
+
+    Drive tags are deleted by retention and never pushed, so the `Drive:`
+    trailer is the only place the counter survives a clone: a clone reading
+    only local tags starts again at drive-0001 while origin/lineage is already
+    saying "during drive-0006". Reusing a number makes that phrase permanently
+    ambiguous on a ref nothing ever prunes -- two different drives, one name,
+    and no way left to tell which promotion belonged to which.
+
+    Trailers only, not `--format=%B`. This ref is small by design -- one
+    commit per promotion, four subsystems promoting maybe weekly -- but a
+    commit BODY is unbounded, and scanning every body for a regex made the
+    cost of naming a drive scale with something nobody bounds. `%(trailers:
+    key=Drive,valueonly)` makes git do the parsing and hand back one short
+    line per commit.
+
+    Every commit, though, not just the tip. A drive whose tag could not be
+    written promotes under `Drive: (untagged)`, and that lands at the tip like
+    any other entry: reading the tip alone would then answer 0 and hand the
+    next drive a name that is already in use further down the same ref.
+    """
+    best = 0
+    for name in [ref] + remote_refs(repo, ref):
+        r = _git(repo, "log", "--format=%(trailers:key=Drive,valueonly)", name)
+        if r.returncode != 0:
+            continue        # ref does not resolve; nothing to learn from it
+        for line in r.stdout.splitlines():
+            m = _DRIVE_NUM.match(line.strip())
+            if m:
+                best = max(best, int(m.group(1)))
+    return best
 
 
 def models_at(repo: str, rev: str) -> str | None:

@@ -8,7 +8,7 @@ that a frame exists for every 100 ms of the drive.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-import re, subprocess, time
+import subprocess, time
 from .plant import Plant, DT
 from .gitstore import Committer
 from . import lineage, retain, safety
@@ -19,8 +19,9 @@ from . import lineage, retain, safety
 # a consequence of DT and drift with it.
 RELATCH_TICKS = 20
 
-# `Drive: drive-0006`, as lineage.message() writes it into every promotion.
-_DRIVE_TRAILER = re.compile(r"^Drive: drive-(\d+)\s*$", re.M)
+# One minute of ticks. The drive lock is a lease, and this is how often the
+# loop renews it -- see the call in the tick body.
+LOCK_REFRESH_TICKS = 600
 
 
 @dataclass
@@ -43,31 +44,6 @@ class DriveReport:
     # The drive ended on a signal rather than on its tick count. Everything
     # below it in this report is still true, just of a shorter drive.
     interrupted: bool = False
-
-
-def _lineage_high_water(repo: str) -> int:
-    """The largest drive number named by a promotion on either lineage ref.
-
-    The tag is deleted by retention and never pushed, so the `Drive:` trailer
-    is the only place the counter survives a clone: a clone that reads only
-    local tags starts again at drive-0001 while origin/lineage is already
-    saying "during drive-0006". Reusing a number makes that phrase permanently
-    ambiguous on a ref that is never pruned -- two different drives, one name,
-    and no way left to tell which promotion belonged to which.
-
-    Both refs, because the local one may not exist yet on a fresh clone and
-    the remote one goes stale the moment this vehicle drives.
-    """
-    best = 0
-    remote = "refs/remotes/origin/" + lineage.REF.rsplit("/", 1)[-1]
-    for ref in (lineage.REF, remote):
-        r = subprocess.run(["git", "log", "--format=%B", ref], cwd=repo,
-                           capture_output=True, text=True, encoding="utf-8")
-        if r.returncode != 0:
-            continue        # ref does not resolve; nothing to learn from it
-        for m in _DRIVE_TRAILER.finditer(r.stdout):
-            best = max(best, int(m.group(1)))
-    return best
 
 
 def _next_drive_tag(repo: str) -> str:
@@ -94,7 +70,16 @@ def _next_drive_tag(repo: str) -> str:
             if t.rsplit("-", 1)[-1].isdigit()]
     # Tags say what this clone has driven; lineage trailers say what the
     # vehicle has driven. The high-water mark is over both.
-    nums.append(_lineage_high_water(repo))
+    #
+    # The tag is deleted by retention and never pushed, so the `Drive:`
+    # trailer is the only place the counter survives a clone: reading local
+    # tags alone starts again at drive-0001 while origin/lineage already says
+    # "during drive-0006", and a reused number makes that phrase permanently
+    # ambiguous on a ref that is never pruned. high_water_drive scans the
+    # trailers on the local lineage ref and on every remote one, newest first
+    # and trailers only, so the counter survives a clone and a renamed remote
+    # without ever walking an unbounded pile of commit bodies.
+    nums.append(lineage.high_water_drive(repo))
     return f"drive-{max(nums, default=0) + 1:04d}"
 
 
@@ -143,110 +128,159 @@ def drive(repo: str, seconds: float, realtime: bool = True,
     # product is that a frame exists for every 100 ms of the drive.
     n_ticks = round(seconds / DT)
 
-    # Tells maintenance to stay off the disk for the length of this drive.
-    # Advisory one way only: it never blocks the drive, and it expires on its
-    # own so a power cut cannot leave the vehicle unable to repack.
-    with retain.drive_lock(repo, seconds):
-        # Started here, not before the lock. Entering drive_lock resolves the
-        # git dir, which raises if git is missing or this is not a repository
-        # -- and started first, the fast-import child was already running with
-        # nothing left to write `done` to it, so it died "stream ends early"
-        # over a failure that happened before the drive began.
-        committer.start()
-        try:
-            # Not a crash path. Ctrl-C and SIGTERM (cli turns the latter into
-            # this same exception) are how a drive is ended early on purpose,
-            # and an interrupted drive is still a drive: its frames are real,
-            # its promotions happened, and it needs its tag as much as any
-            # other -- see the tagging call at the bottom.
-            for i in range(n_ticks):
-                # Tick i is due one full period after the epoch, not at it.
-                # `epoch + i * DT` made tick 0 due at the instant epoch was
-                # sampled, so slack was always microseconds negative and every
-                # drive reported a deadline overrun that never happened -- while
-                # a real first-tick overrun stayed invisible underneath it. It
-                # also ended the drive a tick early: --seconds 14 paced 13.9 s.
-                deadline = epoch + (i + 1) * DT
-                if realtime:
-                    slack = deadline - time.monotonic()
-                    if slack > 0:
-                        time.sleep(slack)
-                    else:
-                        rep.overruns += 1
-                    jitter = (time.monotonic() - deadline) * 1000
-                    rep.max_jitter_ms = max(rep.max_jitter_ms, jitter)
+    # The frame one tick back, which is what lets detect() see a range
+    # shrinking rather than just a range. None on the first tick, and that is
+    # a real state rather than a placeholder: there is no closing speed yet.
+    prev = None
 
-                # Ground truth is read BEFORE the step, because step() ends by
-                # advancing plant.t to the next tick: asked afterwards, the
-                # oracle answered for tick i+1 and detect() was handed
-                # (frame_i, truth_{i+1}) -- perception judged against a world
-                # 100 ms into its own future. It is invisible in the shipped
-                # scenario only because red_light_run also needs
-                # stop_line_crossed, which step() computes internally at the
-                # correct t, so the one tick where the mismatch could show is
-                # already gated by a flag that agrees. A light phase boundary
-                # landing one tick earlier, or any second detector reading the
-                # oracle, turns it into a wrong answer with no symptom.
-                truth = oracle() if oracle else ""
-
-                frame = plant.step()
-
-                # Safety runs before the commit. The record must never be the
-                # thing standing between a hazard and the brakes.
-                if oracle is None:
-                    truth = frame.sensors.light_state
-                seen = safety.detect(frame, truth)
-                kinds_now = {s.kind for s in seen}
-                # Release a latch once its condition has been clear for a while.
-                # The set was only ever added to, so a second genuinely separate
-                # incident of the same kind later in the same drive was discarded
-                # as "still unfolding" however long the gap between them.
-                for kind in [k for k, t in latched.items()
-                             if k not in kinds_now and i - t > RELATCH_TICKS]:
-                    del latched[kind]
-                fresh = [s for s in seen if s.kind not in latched]
-                for s in seen:                  # refresh while it persists
-                    latched[s.kind] = i
-                rep.incidents.extend(fresh)
-                # on_frame still takes a single incident: the most severe one that
-                # is new this tick, or None.
-                inc = fresh[0] if fresh else None
-
-                t0 = time.perf_counter()
-                committer.submit(frame)
-                rep.max_submit_us = max(rep.max_submit_us,
-                                        (time.perf_counter() - t0) * 1e6)
-                rep.ticks += 1
-                if on_frame:
-                    on_frame(frame, inc)
-        except KeyboardInterrupt:
-            # Recorded, not re-raised. Unwinding out of drive() threw away a
-            # report that was entirely true -- the frames, the drops, the
-            # promotions -- and skipped the tagging below, leaving exactly the
-            # dangling "Drive: drive-NNNN" that _tag_drive's warning is about.
-            # The caller decides what an interrupted drive should exit with;
-            # this function's job is to finish telling the truth about it.
-            rep.interrupted = True
-        finally:
-            # stop() has to run even on Ctrl-C, or on a raising on_frame -- cli.py
-            # passes a closure. Skipping it left the daemon drain thread to die at
-            # interpreter exit with `done` never written: fast-import then exits
-            # "stream ends early" and every frame since the last checkpoint, up to
-            # CHECKPOINT_EVERY and so 4.9 s of driving, is gone from the record.
+    # One try around the whole lock/start/tick region. A signal is
+    # asynchronous, so there is no instruction in here it cannot land on, and
+    # guarding the tick loop alone left windows on either side of it: a Ctrl-C
+    # while drive_lock resolved the git dir, or inside committer.start(), or
+    # during the shutdown below, unwound straight out of drive() -- past the
+    # counters, past the tagging -- and the operator got a traceback where the
+    # report of a real, if short, drive belonged. It also left exactly the
+    # dangling "Drive: drive-NNNN" that _tag_drive's warning is about.
+    try:
+        # Tells maintenance to stay off the disk for the length of this drive.
+        # Advisory one way only: it never blocks the drive, and it expires on
+        # its own so a power cut cannot leave the vehicle unable to repack.
+        with retain.drive_lock(repo, seconds) as refresh:
             try:
-                committer.stop()
+                # Started here, not before the lock. Entering drive_lock
+                # resolves the git dir, which raises if git is missing or this
+                # is not a repository -- and started first, the fast-import
+                # child was already running with nothing left to write `done`
+                # to it, so it died "stream ends early" over a failure that
+                # happened before the drive began. Inside the try, because a
+                # signal landing between Popen and the first tick would
+                # otherwise leave that child running with nobody left to close
+                # its stdin.
+                committer.start()
+                # Not a crash path. Ctrl-C and SIGTERM (cli turns the latter
+                # into this same exception) are how a drive is ended early on
+                # purpose, and an interrupted drive is still a drive: its
+                # frames are real, its promotions happened, and it needs its
+                # tag as much as any other -- see the tagging call at the
+                # bottom.
+                for i in range(n_ticks):
+                    # Tick i is due one full period after the epoch, not at it.
+                    # `epoch + i * DT` made tick 0 due at the instant epoch was
+                    # sampled, so slack was always microseconds negative and
+                    # every drive reported a deadline overrun that never
+                    # happened -- while a real first-tick overrun stayed
+                    # invisible underneath it. It also ended the drive a tick
+                    # early: --seconds 14 paced 13.9 s.
+                    deadline = epoch + (i + 1) * DT
+                    if realtime:
+                        slack = deadline - time.monotonic()
+                        if slack > 0:
+                            time.sleep(slack)
+                        else:
+                            rep.overruns += 1
+                        jitter = (time.monotonic() - deadline) * 1000
+                        rep.max_jitter_ms = max(rep.max_jitter_ms, jitter)
+
+                    # Ground truth is read BEFORE the step, because step() ends
+                    # by advancing plant.t to the next tick: asked afterwards,
+                    # the oracle answered for tick i+1 and detect() was handed
+                    # (frame_i, truth_{i+1}) -- perception judged against a
+                    # world 100 ms into its own future. It is invisible in the
+                    # shipped scenario only because red_light_run also needs
+                    # stop_line_crossed, which step() computes internally at
+                    # the correct t, so the one tick where the mismatch could
+                    # show is already gated by a flag that agrees. A light
+                    # phase boundary landing one tick earlier, or any second
+                    # detector reading the oracle, turns it into a wrong answer
+                    # with no symptom.
+                    truth = oracle() if oracle else ""
+
+                    frame = plant.step()
+
+                    # Safety runs before the commit. The record must never be
+                    # the thing standing between a hazard and the brakes.
+                    if oracle is None:
+                        truth = frame.sensors.light_state
+                    seen = safety.detect(frame, truth, prev)
+                    prev = frame
+                    kinds_now = {s.kind for s in seen}
+                    # Release a latch once its condition has been clear for a
+                    # while. The set was only ever added to, so a second
+                    # genuinely separate incident of the same kind later in the
+                    # same drive was discarded as "still unfolding" however long
+                    # the gap between them.
+                    for kind in [k for k, t in latched.items()
+                                 if k not in kinds_now and i - t > RELATCH_TICKS]:
+                        del latched[kind]
+                    fresh = [s for s in seen if s.kind not in latched]
+                    for s in seen:          # hold the latch while it persists
+                        latched[s.kind] = i
+                    rep.incidents.extend(fresh)
+                    # on_frame still takes a single incident: the most severe
+                    # one that is new this tick, or None.
+                    inc = fresh[0] if fresh else None
+
+                    t0 = time.perf_counter()
+                    committer.submit(frame)
+                    rep.max_submit_us = max(rep.max_submit_us,
+                                            (time.perf_counter() - t0) * 1e6)
+                    rep.ticks += 1
+                    if on_frame:
+                        on_frame(frame, inc)
+                    # The lock is a lease, and this is the renewal. It is what
+                    # lets a 5-hour drive stay protected past any fixed cap the
+                    # lock puts on a single lease, while a crash still frees
+                    # maintenance within minutes instead of within whatever
+                    # length the dead drive happened to declare. Once a minute,
+                    # so the cost is nothing next to the tick it rides on.
+                    if i and i % LOCK_REFRESH_TICKS == 0:
+                        refresh()
             finally:
-                # Recorded even if stop() raises. A drive that committed 140
-                # frames and then failed to shut down cleanly should still be able
-                # to tell you it committed 140 frames.
-                rep.dropped = committer.dropped
-                rep.committed = committer.committed
-                rep.promotions = committer.promotions
+                # stop() has to run even on Ctrl-C, or on a raising on_frame --
+                # cli.py passes a closure. Skipping it left the daemon drain
+                # thread to die at interpreter exit with `done` never written:
+                # fast-import then exits "stream ends early" and every frame
+                # since the last checkpoint, up to CHECKPOINT_EVERY and so
+                # 4.9 s of driving, is gone from the record.
+                try:
+                    committer.stop()
+                except KeyboardInterrupt:
+                    # A second signal, arriving while the first one's shutdown
+                    # is draining the queue and joining threads. That is the
+                    # operator insisting, and insisting must not buy them
+                    # another 60 s of joins -- so give up on the orderly path
+                    # and kill the child instead of waiting on it. The frames
+                    # still in the queue are the accepted price of insisting;
+                    # what is not negotiable is leaving fast-import behind
+                    # holding a half-written pack open.
+                    rep.interrupted = True
+                    committer.abandon()
+                finally:
+                    # Recorded even if stop() raises. A drive that committed
+                    # 140 frames and then failed to shut down cleanly should
+                    # still be able to tell you it committed 140 frames.
+                    rep.dropped = committer.dropped
+                    rep.committed = committer.committed
+                    rep.promotions = committer.promotions
+    except KeyboardInterrupt:
+        # Recorded, not re-raised. The caller decides what an interrupted drive
+        # should exit with; this function's job is to finish telling the truth
+        # about it, which is everything the counters above already say.
+        rep.interrupted = True
     # A tag has to bound something. A drive that committed nothing would tag
     # the previous drive's tip, and five such runs left bisect with five names
     # for one commit -- endpoints that cannot be ordered and a range that is
     # empty whichever two you pick. An interrupted drive still tags, because
     # it did commit frames and they are as real as any others.
+    #
+    # One site, reached from every path above -- including the one where the
+    # operator hit Ctrl-C twice -- because the tag is what stops the
+    # promotions this drive already wrote from naming a name that nothing
+    # carries. It is guarded in turn: a signal arriving during `git tag` is
+    # the last window left, and there is nothing to unwind by then anyway.
     if rep.committed:
-        rep.tag = _tag_drive(repo, tag, rep.promotions)
+        try:
+            rep.tag = _tag_drive(repo, tag, rep.promotions)
+        except KeyboardInterrupt:
+            rep.interrupted = True
     return rep

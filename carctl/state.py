@@ -44,6 +44,15 @@ class Actuators:
     steer_cmd: float # rad
 
 
+# Every path a frame commit's tree is allowed to contain, and the only place
+# that list exists. gitstore has to recognise a tree somebody else wrote and
+# used to restate the four names on its own side; two literals that have to
+# agree forever agree only until one of them is edited, and the side that gets
+# left behind is the side that refuses -- or worse, accepts -- every frame of
+# a drive. Frame.tree() below is built from this tuple, so they cannot drift.
+FRAME_PATHS = ("actuators.json", "models.json", "sensors.json", "state.json")
+
+
 @dataclass(frozen=True)
 class Frame:
     seq: int
@@ -95,7 +104,14 @@ class Frame:
         return "\n".join(lines) + "\n"
 
     def tree(self) -> dict[str, str]:
-        return {"state.json": self.state_json(),
-                "sensors.json": self.sensors_json(),
-                "actuators.json": self.actuators_json(),
-                "models.json": self.models_json()}
+        """The complete tree of a frame commit: FRAME_PATHS, nothing else.
+
+        Derived from FRAME_PATHS rather than spelled out again, because the
+        two are one fact: `sensors.json` is written by sensors_json(), and a
+        fifth file has to be added to the tuple and to a method with the
+        matching name before it can appear in a tree at all. A hand-written
+        dict here would let the writer and the checker disagree about what a
+        frame is, silently, in the direction of whichever one was edited last.
+        """
+        return {path: getattr(self, path[:-len(".json")] + "_json")()
+                for path in FRAME_PATHS}

@@ -63,11 +63,12 @@ class StashEntry:
     id: str
     ref: str
     seq: int
-    # Kept in the entry, never consulted by age_s. It is the simulated tick
-    # count -- useful for lining a stash up against the frame log, useless as
-    # an age. There is no RUN_ID beside it any more: it existed only to decide
-    # which of two clocks to believe, and there is one clock now. Entries
-    # written before this carry a run_id key, which list() drops as unknown.
+    # The simulated tick count, and load-bearing again: age_s reads it as one
+    # of the two clocks it takes the max of, because it is the only one that
+    # can see a simulation running faster than the wall. There is still no
+    # RUN_ID beside it -- that existed to decide which clock to believe, and
+    # taking the staler of the two needs nobody to decide. Entries written
+    # before this carry a run_id key, which list() drops as unknown.
     t_mono_ns: int
     return_pose: dict
     preconditions: dict
@@ -130,30 +131,38 @@ class ParkingStash:
         return sorted(entries, key=lambda e: e.seq)
 
     def age_s(self, entry: StashEntry, now: Frame) -> float:
-        """One clock, always the wall clock.
+        """Two clocks, and the staler of the two wins.
 
-        t_mono_ns is not a clock, it is the tick count: simulated time, which
-        advances with the loop and stops when the loop does. So the "within one
-        drive, monotonic is the trustworthy one" branch was reading a stopwatch
-        that only runs while somebody is watching it. Inside one long-lived
-        process a stash an hour old by every real measure reported 2.0 s,
-        passed the freshness check and popped clean -- replaying a parking plan
-        onto a street that had moved on, which is the exact failure the TTL is
-        here to prevent, arriving through the branch that was supposed to be
-        the accurate one.
+        Each clock catches a failure the other cannot see.
 
-        The identity check that picked between the two clocks is gone with it.
-        One clock that is always right beats two that need an arbitrator, and
-        the arbitrator was the part that kept being subtly wrong.
+        The wall clock catches an entry left behind by an earlier process. The
+        tick count restarts with the loop, and across two runs it can even go
+        backwards, so a stash written yesterday can read as a negative
+        simulated age today -- and the max ignores a negative delta by
+        construction, without anything having to notice that is what happened.
+
+        The tick count catches a simulation running faster than the wall,
+        which is the whole point of `--fast`: an hour of street time passes in
+        a second of wall time, the gap has closed and the cyclist has arrived
+        and gone, and it is the WALL reading that is the lie. A wall-only TTL
+        let a stash an hour old by every measure the plan cares about report
+        1.0 s and pop clean, replaying a parking plan onto a street that had
+        moved on -- the exact failure the TTL exists to prevent.
+
+        A TTL wants whichever clock says staler, so take the max. That is also
+        why there is no identity check picking between them any more: the
+        arbitrator is the part that kept being wrong, twice, in both
+        directions. max() needs no arbitrator, because it does not have to
+        know which regime it is in.
 
         t_wall_s carries whole seconds, so the true age is somewhere in
         [wall - 1, wall + 1] and a TTL wants the upper bound: truncating let a
-        45.9 s entry report 45.0 and slip under a 45 s expiry. That 1 s of
-        deliberate over-reading costs nothing against a 45 s TTL, which is the
-        other reason not to miss the finer clock -- at this resolution there is
-        nothing to miss.
+        45.9 s entry report 45.0 and slip under a 45 s expiry. The +1 goes
+        inside the max, on the arm that needs it -- the tick clock is
+        nanoseconds and has nothing to round off.
         """
-        return float(now.t_wall_s - entry.t_wall_s) + 1.0
+        return max(float(now.t_wall_s - entry.t_wall_s) + 1.0,
+                   (now.t_mono_ns - entry.t_mono_ns) / 1e9)
 
     def pop(self, entry: StashEntry, now: Frame, now_pre: Preconditions):
         """Three-way merge against the street. Returns (ok, conflicts)."""

@@ -19,17 +19,41 @@ REPO = ""
 
 
 def _find_repo() -> str:
-    """The repository this invocation is about: the one containing cwd."""
+    """The repository this invocation is about: $CARCTL_REPO, else cwd's.
+
+    The env var comes first because unattended units have no meaningful
+    working directory -- systemd starts a service in /, cron in $HOME -- and
+    "the repo you ran it from" is advice with no addressee there. The
+    __file__-derived answer such a unit may once have leaned on is gone for
+    the reason at the top of this module: it names where carctl is installed,
+    which is not a repository, or is the wrong one. A variable a unit file can
+    set is the replacement.
+    """
+    override = os.environ.get("CARCTL_REPO", "").strip()
     try:
         r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           cwd=os.getcwd(), capture_output=True, text=True,
-                           encoding="utf-8")
+                           cwd=override or os.getcwd(), capture_output=True,
+                           text=True, encoding="utf-8")
     except OSError as exc:
+        # cwd= on a path that is not a directory fails here rather than in
+        # git, and $CARCTL_REPO is the only way that path gets to be wrong.
+        if override:
+            sys.exit(f"carctl: $CARCTL_REPO={override!r} cannot be entered: "
+                     f"{exc}")
         sys.exit(f"carctl: cannot run git: {exc}")
     if r.returncode != 0 or not r.stdout.strip():
         # One line and no traceback. Standing in the wrong directory is an
         # ordinary thing to get wrong at a shell prompt, and a stack trace
         # through subprocess says nothing an operator can act on.
+        #
+        # A garbled $CARCTL_REPO is loud and fatal, the same way a garbled
+        # $CARCTL_WINDOW_DAYS is, and specifically does NOT fall back to cwd:
+        # falling back is how a drive ends up writing its frames into a
+        # repository nobody is looking at, which is the failure this whole
+        # module comment is about.
+        if override:
+            sys.exit(f"carctl: $CARCTL_REPO={override!r} is not a git "
+                     "repository")
         sys.exit("carctl: not inside a git repository (run from the repo the "
                  "record should live in)")
     return os.path.abspath(r.stdout.strip())
@@ -40,6 +64,15 @@ class GitError(RuntimeError):
 
 
 def _run_git(*a) -> subprocess.CompletedProcess:
+    # `replay` is dispatched without resolving a repository, so REPO is "" for
+    # the whole of it, and cwd="" is not "no directory" to subprocess -- it is
+    # a path that does not exist, or on some platforms the current one. Either
+    # way the answer would be about a repository nobody chose. Nothing on the
+    # replay path calls git today; this is what makes the first one that does
+    # fail with a sentence instead of with cwd='' garbage or, worse, an answer.
+    if not REPO:
+        raise GitError("no repository resolved for this command, so there is "
+                       "nothing here to ask git about")
     return subprocess.run(["git", *a], cwd=REPO, capture_output=True,
                           text=True, encoding="utf-8")
 
@@ -126,6 +159,16 @@ def cmd_drive(args):
     def on_frame(f, inc):
         if inc:
             seen.append((f, inc))
+    # Before the drive, not before the first publish. The raw frames this
+    # command is about to write are exactly what the guard protects -- 10 Hz
+    # poses on refs/heads/main, the branch this repo is usually sitting on --
+    # so installing it at publish time left every repo that had driven and not
+    # yet published in the window where one habitual `git push` sends the lot.
+    # Warnings rather than failures: a guard that could not be installed is
+    # worth a line on the way past, and is never a reason to stop a vehicle
+    # from recording what it is doing.
+    for line in pubmod.ensure_push_safety(REPO):
+        print(line)
     # Installed for the drive and restored after it. A signal handler is
     # process-global state, so leaving one behind would change how anything
     # later in this process dies. Guarded twice over: SIGTERM does not exist
@@ -140,12 +183,26 @@ def cmd_drive(args):
     try:
         rep = loopmod.drive(REPO, args.seconds, realtime=not args.fast,
                             on_frame=on_frame)
-    except RuntimeError as exc:
+    except (RuntimeError, retainmod.MaintenanceError, OSError) as exc:
         # gitstore refuses outright to append frames onto a tip that is not a
-        # frame history, and reports a dead fast-import the same way. Both are
-        # conditions an operator fixes by running the command somewhere else;
-        # neither is served by a traceback.
+        # frame history, and reports a dead fast-import the same way. The other
+        # two are the same shape from further out: drive_lock resolves the git
+        # dir and raises MaintenanceError when that fails, and OSError is the
+        # git binary having vanished between one command and the next. All
+        # three are conditions an operator fixes by running the command
+        # somewhere else, or by fixing their PATH; none is served by a
+        # traceback out of the middle of a drive.
         sys.exit(f"carctl drive: {exc}")
+    except KeyboardInterrupt:
+        # The last net. drive() records an interrupt on every path it owns and
+        # returns a report, so reaching this means the signal landed outside
+        # it -- between the handler going in and the drive starting, say, or
+        # while this function was still printing. There is no report to print
+        # by then, but there is still an exit code to get right, and it is the
+        # same 130 an interrupted drive uses below.
+        print("\ncarctl drive: interrupted before the drive could report; "
+              "any frames it committed are on refs/heads/main")
+        sys.exit(130)
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
@@ -195,6 +252,12 @@ def cmd_incident(args):
     # runs at all, so the `now = f` below raised UnboundLocalError where "no
     # incident" was the honest answer.
     f = None
+    # The previous frame, threaded through so detect() can see a range
+    # shrinking. This command re-drives the scenario to explain an incident
+    # that a drive reported, so it has to be handed the same inputs the drive
+    # handed detect() -- one missing argument here and it explains a drive
+    # nobody took, or fails to find the incident it was asked about.
+    prev = None
     # round, not int, for the reason loop.py gives: int(2.9 / 0.1) is 28.
     for _ in range(round(args.seconds / 0.1)):
         # Ground truth for THIS tick, read before step() advances the clock
@@ -204,9 +267,10 @@ def cmd_incident(args):
         # ends up explaining a drive that differs from the one that ran.
         truth = plant.true_light()
         f = plant.step()
-        for inc in safety.detect(f, truth):
+        for inc in safety.detect(f, truth, prev):
             if inc.kind == args.kind and hit is None:
                 hit = (f, inc)
+        prev = f
         if hit and f.seq == hit[0].seq + 8:
             now = f
             break
@@ -430,6 +494,11 @@ def cmd_replay(args):
 
     plant = Plant(checkpoints)
     found = []
+    # Same reason as cmd_incident: detect() judges a frame against the one
+    # before it, and a bisect step that fed it None every tick would be
+    # answering with a weaker detector than the drive used -- every commit in
+    # the range coming back clean is a bisect result, and a wrong one.
+    prev = None
     for _ in range(seq + 1):
         # Before the step, matching loop.drive and cmd_incident: step() ends
         # by advancing plant.t, so the oracle asked afterwards describes the
@@ -441,8 +510,9 @@ def cmd_replay(args):
         # says that, and the filter is what keeps it true of the answer rather
         # than of the loop: a bisect step must judge the commit it was handed,
         # not the crash that came four seconds after it.
-        found += [i for i in safety.detect(f, truth)
+        found += [i for i in safety.detect(f, truth, prev)
                   if i.seq <= seq and args.kind in ("", i.kind)]
+        prev = f
     what = args.kind or "incident"
 
     print(f"replaying seq 0..{seq} with the checked-out checkpoint set held "
@@ -524,7 +594,13 @@ def cmd_publish(args):
     if not args.push:
         print("not pushed. to publish:  carctl publish --push")
         return
-    ok, msg = pubmod.push(REPO)
+    # audited=True: this command has just run audit() and audit_lineage()
+    # above, on the same refs, in the same process, with nothing in between
+    # that could move them. push() re-auditing would be a second full pass
+    # over every blob on both refs for no new information. The flag says "a
+    # gate was passed", not "skip the gate" -- push() still audits by default,
+    # because a library caller has not necessarily run one.
+    ok, msg = pubmod.push(REPO, audited=True)
     if not ok:
         # Non-zero. A push that did not happen is the one outcome of this
         # command a caller most needs to be able to detect without reading

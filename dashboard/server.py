@@ -121,12 +121,25 @@ def _drive_forever() -> None:
         # Reset with the seq numbering, for the same reason: the door is a
         # property of this drive's history, not of the process.
         one_way_door = False
+        prev = None                    # previous frame, for detect's closing-speed gate
         for _ in range(180):
             if STATE["halted"]:
                 break
+            # Ground truth is read BEFORE the step, for the reason loop.py
+            # spells out at its own call site: step() ends by advancing the
+            # plant to the next tick, so asked afterwards the oracle answers
+            # for tick i+1 and detect() judges frame_i against a world 100 ms
+            # into its own future. loop.drive, cmd_incident and cmd_replay all
+            # sample in this order; this was the fourth call site, still
+            # sampling late. A light phase boundary landing on a tick edge
+            # then makes this display's incidents disagree with the record's
+            # on the very same deterministic script -- a safety display
+            # contradicting the plane of record it claims to show.
+            truth = plant.true_light()
             f = plant.step()
-            fresh = [i for i in safety.detect(f, plant.true_light())
+            fresh = [i for i in safety.detect(f, truth, prev)
                      if i.kind not in latched]
+            prev = f
             for i in fresh:
                 latched.add(i.kind)
             inc = fresh[0] if fresh else None
@@ -226,6 +239,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(payload).encode())
 
     # ---- reads -------------------------------------------------------------
+    def _serve_index(self, head: bool) -> None:
+        """The index route, for GET and HEAD alike.
+
+        One builder, one set of headers. do_HEAD used to carry its own copy of
+        this minus the body write, so every header or token-substitution
+        change had to be mirrored by hand -- and a HEAD whose headers drift
+        from GET's is a HEAD nothing can use to decide whether to fetch the
+        page.
+
+        The token reaches the page and nowhere else. Requiring it as a custom
+        header also forces a CORS preflight on any cross-origin attempt, which
+        we never answer.
+        """
+        with open(os.path.join(HERE, "index.html"), "rb") as fh:
+            body = fh.read().replace(b"__REVERT_TOKEN__", TOKEN.encode())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        # This body carries the halt token. A cached copy is that token
+        # sitting in a disk cache long after the process that minted it
+        # exited, and the stale page served back from it is one whose
+        # every halt is refused while it looks perfectly healthy.
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head:                # no body on HEAD: that is the whole point
+            self.wfile.write(body)
+
     def do_GET(self):
         why = self._host_ok()
         if why:
@@ -266,21 +306,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         subscribers.remove(q)
             return
         if route in ("/", "/index.html"):
-            # The token reaches the page and nowhere else. Requiring it as a
-            # custom header also forces a CORS preflight on any cross-origin
-            # attempt, which we never answer.
-            with open(os.path.join(HERE, "index.html"), "rb") as fh:
-                body = fh.read().replace(b"__REVERT_TOKEN__", TOKEN.encode())
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            # This body carries the halt token. A cached copy is that token
-            # sitting in a disk cache long after the process that minted it
-            # exited, and the stale page served back from it is one whose
-            # every halt is refused while it looks perfectly healthy.
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._serve_index(head=False)
             return
         # No fallthrough to a static file handler. Serving the dashboard
         # directory meant GET /server.py returned this file verbatim, guards
@@ -299,16 +325,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._deny(why); return
         route = self._route()
         if route in ("/", "/index.html"):
-            with open(os.path.join(HERE, "index.html"), "rb") as fh:
-                body = fh.read().replace(b"__REVERT_TOKEN__", TOKEN.encode())
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            # The length GET would have sent. A HEAD that lies about it is a
-            # HEAD nothing can use to decide whether to fetch the page.
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            return                  # no body: that is the whole point of HEAD
+            self._serve_index(head=True)
+            return
+        # /events falls through to 404 on purpose: EventSource never issues
+        # HEAD, and answering 200 with an unconsumed stream would hold a
+        # handler thread for nothing.
         self.send_error(404)
 
     def _unsupported(self):

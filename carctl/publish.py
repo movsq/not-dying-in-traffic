@@ -29,7 +29,9 @@ the rewrite.
 """
 from __future__ import annotations
 import json
+import os
 import re
+import stat
 import subprocess
 
 from . import lineage
@@ -267,7 +269,7 @@ def _filter(stream: bytes, src: bytes, dst: bytes) -> bytes:
     return bytes(out)
 
 
-def _ensure_push_guard(repo: str) -> str:
+def _ensure_push_guard(repo: str) -> list[str]:
     """Make a bare `git push` from this repo fail instead of guessing.
 
     `push.default` decides what `git push` with no refspec sends. Every value
@@ -287,28 +289,139 @@ def _ensure_push_guard(repo: str) -> str:
     turns the guard into a shortcut around the gate. The job here is the
     opposite: a bare push fails loudly, and `carctl publish --push`, which
     audits first, stays the only path that reaches the remote.
+
+    Returns warning lines, and raises nothing. A guard that cannot be armed is
+    a fact the caller has to carry into its own report; raising here made a
+    config.lock collision -- a `git config` running anywhere else in this repo
+    at the same instant -- into a failure of whatever operation happened to be
+    asking, which is how this ended up aborting a retention pass partway.
     """
     have = subprocess.run(["git", "config", "--local", "--get", "push.default"],
                           cwd=repo, capture_output=True, text=True,
                           encoding="utf-8")
     if have.returncode == 0 and have.stdout.strip():
-        return (f"push.default is already {have.stdout.strip()!r} in this "
-                "repo's config, left as the operator set it")
+        value = have.stdout.strip()
+        if value == "nothing":
+            return []
+        return [f"push.default is {value!r} in this repo's config, left as the "
+                "operator set it; a bare `git push` here picks branches on its "
+                "own, and the branch this repo is on is main"]
     r = subprocess.run(["git", "config", "--local", "push.default", "nothing"],
                        cwd=repo, capture_output=True, text=True,
                        encoding="utf-8")
     if r.returncode != 0:
-        raise RuntimeError("could not set push.default=nothing, so a bare "
-                           f"`git push` here is not guarded: {r.stderr.strip()}")
-    return "push.default set to nothing"
+        return ["could not set push.default=nothing, so a bare `git push` here "
+                f"is not guarded: {r.stderr.strip()}"]
+    return []
+
+
+# Deliberately /bin/sh and deliberately tiny: this file is read by whoever is
+# about to push, and a guard nobody can read in ten seconds is a guard nobody
+# trusts. It is also compared byte for byte against what is on disk, which is
+# how ensure_push_safety tells its own work from somebody else's hook.
+_PRE_PUSH_HOOK = """#!/bin/sh
+# carctl push guard -- installed by carctl.
+#
+# refs/heads/main HERE is exact 10 Hz poses for one named person. The remote's
+# main carries refs/heads/public, the scrubbed rebuild. So the only local ref
+# allowed on the left of a refspec ending at the remote's main is public.
+#
+# push.default=nothing only blocks the BARE `git push`, and git's own error
+# for that helpfully suggests naming a refspec -- `git push origin main` --
+# which is precisely the push that must never happen. This hook is the guard
+# on the spelling git itself recommends.
+while read -r local_ref local_sha remote_ref remote_sha
+do
+	case "$remote_ref" in
+	refs/heads/main)
+		if [ "$local_ref" != "refs/heads/public" ]; then
+			echo "carctl: refusing to push $local_ref -> $remote_ref" >&2
+			echo "carctl: the remote's main carries refs/heads/public, the scrubbed ref;" >&2
+			echo "carctl: this repo's refs/heads/main is exact 10 Hz poses and stays in the car." >&2
+			echo "carctl: publish with:  carctl publish --push" >&2
+			exit 1
+		fi
+		;;
+	esac
+done
+exit 0
+"""
+
+
+def ensure_push_safety(repo: str) -> list[str]:
+    """Arm both push guards. Returns warning lines; never raises.
+
+    Two guards, because they cover different spellings of the same mistake.
+    `push.default=nothing` covers the bare `git push`. The hook covers
+    `git push origin main` -- the refspec git's own error message recommends
+    when the bare form is refused, which makes it the likeliest next thing
+    typed by the person who just read that error.
+
+    Never raises, and returns lines rather than printing them, because the
+    callers are a publish command and a drive: neither has any business
+    failing because a guard could not be armed, and both have a report to put
+    the warning in. A guard that aborts the operation it protects is how this
+    used to poison a retention pass partway through its destructive window.
+
+    The hook lives in .git/hooks, which does not clone and does not travel in
+    any ref, so every working copy has to install its own. That is why this
+    runs from `carctl drive` -- the command that creates the sensitive data,
+    and therefore the first moment a clone has anything to protect -- as well
+    as from publish.
+    """
+    warnings = _ensure_push_guard(repo)
+    hooks = subprocess.run(["git", "rev-parse", "--git-path", "hooks"],
+                           cwd=repo, capture_output=True, text=True,
+                           encoding="utf-8")
+    if hooks.returncode != 0 or not hooks.stdout.strip():
+        return warnings + ["could not locate this repo's hooks directory, so "
+                           "the pre-push guard is not installed: "
+                           + (hooks.stderr.strip() or "git said nothing")]
+    # --git-path answers relative to the repo root, and honours core.hooksPath,
+    # which is the whole reason for asking git instead of joining ".git/hooks".
+    path = os.path.join(repo, hooks.stdout.strip(), "pre-push")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            existing = fh.read()
+    except OSError:
+        existing = None
+    if existing is not None:
+        if existing == _PRE_PUSH_HOOK:
+            return warnings            # already ours, nothing to say
+        # Not overwritten. A pre-push hook is somebody's decision about this
+        # repo, and silently replacing it would be this tool deciding for them
+        # -- possibly deleting the very check they wrote. Named loudly instead,
+        # because until it is dealt with the second guard is not armed.
+        return warnings + [
+            f"{path} already exists and was left alone, so the pre-push guard "
+            "is not armed; a push of refs/heads/main to the remote's main is "
+            "refused only by push.default. Move it aside and re-run, or add "
+            "the refusal to it by hand"]
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_PRE_PUSH_HOOK)
+        # 0755, not the umask's guess: git runs a hook only if it is
+        # executable, and a hook that silently does not run is worse than none.
+        os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP
+                 | stat.S_IROTH | stat.S_IXOTH)
+    except OSError as exc:
+        return warnings + [f"could not install the pre-push guard at {path}: "
+                           f"{exc}"]
+    return warnings
 
 
 def build_public_ref(repo: str, src: str = "refs/heads/main",
                      dst: str = "refs/heads/public") -> str:
-    # Before the ref exists, not after. The window where a scrubbed copy of
-    # main sits in a repo whose bare push still guesses at branches is the
-    # window this guard exists to close.
-    _ensure_push_guard(repo)
+    # No push guard here. It used to be armed on the way in, on the reasoning
+    # that the window between a scrubbed copy existing and the push being
+    # guarded should be zero -- but retain.prune() calls this from inside its
+    # destructive window, after the doomed refs are deleted and the shallow
+    # boundary is written, and `git config` there can lose a config.lock race
+    # and take the whole retention pass down half-finished. Retention has no
+    # business writing config. push() and ensure_push_safety() are the guard
+    # sites, and ensure_push_safety runs from `carctl drive` -- before any of
+    # this exists, which closes the window from the other end.
     exported = subprocess.run(["git", "fast-export", src], cwd=repo,
                               capture_output=True, check=True).stdout
     rewritten = _filter(exported, src.encode(), dst.encode())
@@ -338,6 +451,42 @@ def _git_out(repo: str, *args: str) -> str:
     if r.returncode != 0:
         raise AuditError(f"`git {' '.join(args)}` failed: {r.stderr.strip()}")
     return r.stdout
+
+
+def _batch_blobs(repo: str, oids: list[str]):
+    """Yield (oid, payload) for every oid, through one `git cat-file --batch`.
+
+    One cat-file for a whole ref, not one `git show` per commit. Both audits
+    need exactly this and both used to carry their own copy of the length-
+    prefixed parser -- near-verbatim, down to the same header check -- so a
+    fix to one was a fix to one. There is one copy now and two checks on top
+    of it.
+
+    Every parse failure is an AuditError rather than a skipped blob, for the
+    reason the whole module keeps repeating: a gate that answers the same way
+    when it passes and when it could not look is worse than no gate. A missing
+    object comes back as `<oid> missing`, which is two fields, not three.
+    """
+    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=repo,
+                           input=("\n".join(oids) + "\n").encode(),
+                           capture_output=True)
+    if batch.returncode != 0:
+        raise AuditError("`git cat-file --batch` failed: "
+                         + batch.stderr.decode("utf-8", "replace").strip())
+    buf, pos = batch.stdout, 0
+    while pos < len(buf):
+        eol = buf.find(b"\n", pos)
+        if eol == -1:
+            break
+        header = buf[pos:eol].split()
+        start, pos = pos, eol + 1
+        if len(header) != 3 or header[1] != b"blob":
+            # The header line itself, not buf[:eol]: sliced from the start of
+            # the buffer that quotes every blob read so far into the message.
+            raise AuditError(f"unexpected cat-file header {buf[start:eol]!r}")
+        size = int(header[2])
+        yield header[0].decode(), buf[pos:pos + size]
+        pos += size + 1
 
 
 def _check_blob(path: str, raw: bytes) -> list[str]:
@@ -370,30 +519,13 @@ def _blob_problems(repo: str, ref: str) -> list[str]:
     if not wanted:
         raise AuditError(f"{ref} exposes none of {sorted(_SCRUBBERS)}; "
                          "refusing to bless a ref this does not understand")
-    # One cat-file for the whole ref, not one `git show` per commit.
-    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=repo,
-                           input=("\n".join(wanted) + "\n").encode(),
-                           capture_output=True)
-    if batch.returncode != 0:
-        raise AuditError("`git cat-file --batch` failed: "
-                         + batch.stderr.decode("utf-8", "replace").strip())
     # Aggregated per path, not per blob. A ref with 280 unscrubbed frames is
     # one defect reported once, not 280 lines nobody reads to the end of.
     counts: dict[str, list] = {}
-    buf, pos = batch.stdout, 0
-    while pos < len(buf):
-        eol = buf.find(b"\n", pos)
-        if eol == -1:
-            break
-        header = buf[pos:eol].split()
-        pos = eol + 1
-        if len(header) != 3:
-            raise AuditError(f"unexpected cat-file header {buf[:eol]!r}")
-        oid, size = header[0].decode(), int(header[2])
-        for why in _check_blob(wanted[oid], buf[pos:pos + size]):
+    for oid, payload in _batch_blobs(repo, list(wanted)):
+        for why in _check_blob(wanted[oid], payload):
             seen = counts.setdefault(why, [0, oid])
             seen[0] += 1
-        pos += size + 1
     return [f"{why} ({n} of {sum(1 for p in wanted.values() if p == why.split()[0])}"
             f" blobs, e.g. {oid[:12]})" for why, (n, oid) in sorted(counts.items())]
 
@@ -477,38 +609,43 @@ def audit_lineage(repo: str, ref: str = lineage.REF) -> list[str]:
     if not blobs:
         raise AuditError(f"{ref} exposes no models.json at all; refusing to "
                          "bless a ref this does not understand")
-    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=repo,
-                           input=("\n".join(blobs) + "\n").encode(),
-                           capture_output=True)
-    if batch.returncode != 0:
-        raise AuditError("`git cat-file --batch` failed: "
-                         + batch.stderr.decode("utf-8", "replace").strip())
     # Aggregated, like _blob_problems: a ref with 300 unreadable entries is one
-    # defect reported once, not 300 lines nobody reads to the end of.
+    # defect reported once, not 300 lines nobody reads to the end of. Same
+    # reader as _blob_problems, different check on top of it.
     bad: dict[str, list] = {}
-    buf, pos = batch.stdout, 0
-    while pos < len(buf):
-        eol = buf.find(b"\n", pos)
-        if eol == -1:
-            break
-        header = buf[pos:eol].split()
-        pos = eol + 1
-        if len(header) != 3:
-            raise AuditError(f"unexpected cat-file header {buf[:eol]!r}")
-        oid, size = header[0].decode(), int(header[2])
+    for oid, payload in _batch_blobs(repo, blobs):
         try:
-            scrub_models(buf[pos:pos + size])
+            scrub_models(payload)
         except Unscrubbable as exc:
             seen = bad.setdefault(str(exc), [0, oid])
             seen[0] += 1
-        pos += size + 1
     problems += [f"models.json on this ref is not a checkpoint set: {why} "
                  f"({n} of {len(blobs)} blobs, e.g. {oid[:12]})"
                  for why, (n, oid) in sorted(bad.items())]
     return sorted(set(problems))
 
 
-def push(repo: str, remote: str = "origin") -> tuple[bool, str]:
+# What git says when the remote has history the pushed ref does not contain.
+# Matched on three spellings because the wording moved between git versions
+# and the remedy is the same for all of them.
+_REJECTED = ("non-fast-forward", "[rejected]", "fetch first")
+
+
+def _push_one(repo: str, remote: str, refspec: str) -> tuple[bool, str]:
+    r = subprocess.run(
+        ["git", "push", remote, refspec],
+        cwd=repo, capture_output=True, text=True, encoding="utf-8", timeout=180)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+def _with(warnings: list[str], text: str) -> str:
+    """Warnings first, then the outcome. A guard that could not be armed is
+    not a reason to fail a push, but it is not something to drop either."""
+    return "\n".join([f"warning: {w}" for w in warnings] + [text]).strip()
+
+
+def push(repo: str, remote: str = "origin",
+         audited: bool = False) -> tuple[bool, str]:
     """Push the public ref, and lineage alongside it.
 
     Lineage goes because it is publishable by construction: it was designed to
@@ -521,35 +658,81 @@ def push(repo: str, remote: str = "origin") -> tuple[bool, str]:
     pushing lineage verbatim was the same "publishable by construction"
     reasoning the whole public ref exists to distrust, and it shipped the car
     owner's address on every lineage commit.
+
+    `audited=True` says the caller already ran audit() and audit_lineage() in
+    this invocation and stopped if either had anything to say -- which is
+    exactly what `carctl publish` does before it gets here, so the default
+    made the plain form audit the same two refs twice. It is opt-in, not the
+    default, because a library caller that has run no gate at all must not get
+    an unaudited push by forgetting an argument.
+
+    Two pushes, not one. Sending both refspecs in a single `git push` meant a
+    remote that refused lineage refused the whole command, and this reported
+    total failure -- while public had in fact landed, because git pushes what
+    it can. "Nothing was published" and "half of it was" need opposite next
+    actions from whoever reads it.
     """
-    _ensure_push_guard(repo)
-    try:
-        problems = audit(repo)
-    except AuditError as exc:
-        return False, f"audit could not complete, nothing pushed: {exc}"
-    if problems:
-        return False, "audit failed, nothing pushed:\n  " + "\n  ".join(problems)
-    refspecs = ["refs/heads/public:refs/heads/main"]
-    if subprocess.run(["git", "rev-parse", "--verify", "--quiet", lineage.REF],
-                      cwd=repo, capture_output=True).returncode == 0:
+    warnings = ensure_push_safety(repo)
+    if not audited:
+        try:
+            problems = audit(repo)
+        except AuditError as exc:
+            return False, _with(warnings,
+                                f"audit could not complete, nothing pushed: {exc}")
+        if problems:
+            return False, _with(warnings, "audit failed, nothing pushed:\n  "
+                                + "\n  ".join(problems))
+    have_lineage = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", lineage.REF],
+        cwd=repo, capture_output=True).returncode == 0
+    if have_lineage and not audited:
         try:
             lineage_problems = audit_lineage(repo)
         except AuditError as exc:
-            return False, ("the lineage audit could not complete, nothing "
-                           f"pushed: {exc}")
+            return False, _with(warnings, "the lineage audit could not "
+                                f"complete, nothing pushed: {exc}")
         if lineage_problems:
             # The whole push, not just the lineage half. Pushing public alone
             # and reporting the lineage failure would publish the puzzle and
             # keep the answer, which is the thing this pair exists to avoid --
-            # and it would do it while calling itself a partial success.
-            return False, ("lineage audit failed, nothing pushed:\n  "
-                           + "\n  ".join(lineage_problems)
-                           + "\n  `carctl lineage --rebuild` rewrites the ref "
-                             "from main with the public identity; entries "
-                             "written before that identity was adopted still "
-                             "carry the car's own address")
-        refspecs.append(f"{lineage.REF}:{lineage.REF}")
-    r = subprocess.run(
-        ["git", "push", remote, *refspecs],
-        cwd=repo, capture_output=True, text=True, encoding="utf-8", timeout=180)
-    return r.returncode == 0, (r.stderr or r.stdout).strip()
+            # and it would do it while calling itself a partial success. Both
+            # gates therefore run before either push starts.
+            return False, _with(warnings,
+                                "lineage audit failed, nothing pushed:\n  "
+                                + "\n  ".join(lineage_problems)
+                                + "\n  `carctl lineage --rebuild` rewrites the "
+                                  "ref from main with the public identity; "
+                                  "entries written before that identity was "
+                                  "adopted still carry the car's own address")
+    ok, out = _push_one(repo, remote, "refs/heads/public:refs/heads/main")
+    if not ok:
+        return False, _with(warnings, f"public was refused, nothing pushed:\n{out}")
+    if not have_lineage:
+        return True, _with(warnings, out)
+    ok, lineage_out = _push_one(repo, remote, f"{lineage.REF}:{lineage.REF}")
+    if ok:
+        return True, _with(warnings, "\n".join(x for x in (out, lineage_out) if x))
+    if any(mark in lineage_out for mark in _REJECTED):
+        # The expected failure, once, on every vehicle that has run `carctl
+        # lineage --rebuild`. The rebuild re-derives the ref from main under
+        # the public identity, so its commits are new objects with new shas
+        # and the remote's copy is not an ancestor of them.
+        return False, _with(warnings, (
+            f"public is pushed and current on {remote}; lineage was REFUSED "
+            "and is the only thing outstanding:\n" + lineage_out
+            + f"\n\n  The remote still carries the pre-rebuild {lineage.REF}: "
+              "the history written before the public identity was adopted, "
+              "with the car owner's own address on every commit. The rebuilt "
+              "ref does not descend from it, so a fast-forward is impossible "
+              "and git is right to refuse.\n"
+              "  Force it, deliberately, once:\n\n"
+              f"      git push {remote} +{lineage.REF}:{lineage.REF}\n\n"
+              "  Forcing is the correct answer here and not a way around the "
+              "gate: the rewrite exists precisely to take that address off a "
+              "ref that is kept forever, so the history being discarded is "
+              "the one nobody wants kept. Nothing else is lost -- the shas "
+              "were re-derived from the same promotions on main, entry for "
+              "entry, and the previous tip is still on this vehicle at "
+              "refs/backup/lineage-before-<sha>."))
+    return False, _with(warnings, f"public is pushed and current on {remote}; "
+                        f"the lineage push failed:\n{lineage_out}")
