@@ -27,14 +27,21 @@ retention window and that ref does not, so once main is pruned the lineage ref
 is the only surviving record of when a model shipped. See lineage.py.
 """
 from __future__ import annotations
-import queue, subprocess, tempfile, threading, time
+import os, queue, subprocess, tempfile, threading, time
 from .state import Frame
 from . import lineage, msgen
+from .publish import PUBLIC_IDENT
 
 CHECKPOINT_EVERY = 50   # frames, 5 s of driving
 QUEUE_DEPTH = 512       # frames, about 51 s of backlog before we start dropping
 
 IDENT = b"not-dying-in-traffic <vsedlacek1337@gmail.com>"
+
+# Exactly what a frame commit's tree is allowed to contain -- Frame.tree()'s
+# keys, restated here because this is the side that has to recognise a tree
+# somebody else wrote.
+FRAME_PATHS = frozenset(("state.json", "sensors.json", "actuators.json",
+                         "models.json"))
 
 
 def _data(payload: bytes) -> bytes:
@@ -103,6 +110,70 @@ class Committer:
                 self.dropped += 1        # refilled again; this frame is lost
 
     # ---- committer-thread side ---------------------------------------------
+    def _check_frame_tree(self) -> None:
+        """Refuse to append frames onto a tip that is not a frame.
+
+        _emit writes `from <ref>^0` and no `deleteall`, so fast-import
+        inherits the parent commit's entire tree and the frame's four files
+        are only overlaid on top of it. Driving in a repo with the source
+        checked into main -- the easy mistake, because that is the branch this
+        package is developed on -- therefore stamped carctl/, README.md and
+        the rest into every single frame commit: source and record fused into
+        one tree, which is the exact mixing the Source section exists to
+        prevent. Nothing detects it afterwards either, so the check has to
+        happen before the first commit rather than after the drive.
+        """
+        r = subprocess.run(["git", "ls-tree", "--name-only", self.ref.decode()],
+                           cwd=self.repo, capture_output=True, text=True,
+                           encoding="utf-8")
+        if r.returncode != 0:
+            raise RuntimeError(f"cannot read the tree at {self.ref.decode()}: "
+                               f"{r.stderr.strip()}")
+        extra = sorted({n.strip() for n in r.stdout.splitlines() if n.strip()}
+                       - FRAME_PATHS)
+        if extra:
+            shown = ", ".join(extra[:6]) + (", ..." if len(extra) > 6 else "")
+            raise RuntimeError(
+                f"{self.ref.decode()} is not a frame history: its tip carries "
+                f"{shown}. Every frame of this drive would inherit that tree, "
+                "because frames are appended onto it rather than replacing "
+                "it. Run carctl from the repository the record lives in, not "
+                "from the one the source lives in.")
+
+    def _seed_lineage(self) -> None:
+        """Adopt origin's lineage before anything reads the local ref.
+
+        `git clone` materialises only HEAD's branch, so a clone of this repo
+        arrives with refs/remotes/origin/lineage and no refs/heads/lineage at
+        all. models_at() then found nothing in force: the first frame of the
+        first drive read as "record 4 checkpoints" rather than as the rollback
+        off the promoted checkpoint that it actually is, the promotion it
+        wrote rooted a second parallel lineage, and every promotion the fleet
+        had already published was orphaned by the act of driving once. blame
+        then answered from the provisional main path instead of the ref built
+        to outlive it.
+        """
+        local = self.lineage_ref.decode()
+        if subprocess.run(["git", "rev-parse", "--verify", "--quiet", local],
+                          cwd=self.repo, capture_output=True).returncode == 0:
+            return
+        upstream = "refs/remotes/origin/" + local.rsplit("/", 1)[-1]
+        r = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", upstream],
+            cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
+        if r.returncode != 0:
+            return          # nothing published to continue; root one below
+        seed = subprocess.run(["git", "update-ref", local, r.stdout.strip()],
+                              cwd=self.repo, capture_output=True, text=True,
+                              encoding="utf-8")
+        if seed.returncode != 0:
+            # Not fatal -- the drive can still record its promotions -- but it
+            # is about to root a lineage parallel to the published one, and
+            # that is worth saying out loud rather than discovering later.
+            print(f"warning: could not seed {local} from {upstream}: "
+                  f"{seed.stderr.strip()}; this drive's promotions will start "
+                  "a lineage of their own")
+
     def start(self) -> None:
         # fast-import treats a ref it has not seen as new and roots the first
         # commit, which loses every previous drive. Continue the existing tip
@@ -112,6 +183,12 @@ class Committer:
             ["git", "rev-parse", "--verify", "--quiet", self.ref.decode()],
             cwd=self.repo, capture_output=True, text=True, encoding="utf-8")
         self._need_from = existing.returncode == 0
+        if self._need_from:
+            self._check_frame_tree()
+        # Before models_at, not after: what the local ref says is the whole
+        # input to the promotion decision, and on a fresh clone it says
+        # nothing until this has run.
+        self._seed_lineage()
         # What the lineage ref already says is in force. Comparing against
         # this rather than against the first frame is what makes a checkpoint
         # swapped while the vehicle was parked show up as a promotion instead
@@ -124,10 +201,25 @@ class Committer:
         # stdin, and the committer thread blocks writing to it. Deadlock at
         # the end of a drive, with the loop already finished.
         self._stderr = tempfile.TemporaryFile()
+        # Launched into its own process group, which is the only reason a
+        # Ctrl-C can be survived at all. A terminal sends SIGINT to the entire
+        # foreground process group, so in the shared group fast-import died on
+        # the same keystroke that ended the drive -- and `done`, which the
+        # drain thread writes and which is what makes the last
+        # <= CHECKPOINT_EVERY frames durable, can only be written to a child
+        # that outlived the ^C. Interrupting a drive used to cost up to 5 s of
+        # frames for no reason but the signal's blast radius.
+        #
+        # Two spellings because the two platforms have no shared one:
+        # start_new_session is setsid(), which does not exist on Windows,
+        # where a new group is a CreateProcess flag instead. Both mean "not in
+        # the terminal's group"; neither is a no-op we could skip.
+        detached = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                    if os.name == "nt" else {"start_new_session": True})
         self._proc = subprocess.Popen(
             ["git", "fast-import", "--date-format=raw", "--quiet", "--done"],
             cwd=self.repo, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=self._stderr,
+            stdout=subprocess.DEVNULL, stderr=self._stderr, **detached,
         )
         self._thread = threading.Thread(target=self._drain, daemon=True)
         self._thread.start()
@@ -156,8 +248,17 @@ class Committer:
         at it before deciding there is a promotion to write at all.
         """
         msg = lineage.message(changed, f.t_wall_s, self.drive_tag, f.seq)
+        # The fleet identity, not IDENT. lineage is the one ref designed to be
+        # pushed and then kept forever, so it has to be publishable by
+        # construction -- and construction is here, at the only place these
+        # commits are ever written. Scrubbing it afterwards is not available:
+        # rewriting an identity changes every sha on a ref whose whole value
+        # is that its shas are stable references from blame. publish.audit()
+        # checks for exactly this and would refuse the push, which is a late
+        # and useless place to learn it. main keeps IDENT deliberately: those
+        # frames carry a location feed and are never published.
         out = [b"commit " + self.lineage_ref + b"\n",
-               b"committer " + IDENT + b" %d " % f.t_wall_s
+               b"committer " + PUBLIC_IDENT + b" %d " % f.t_wall_s
                + _tz_offset(f.t_wall_s) + b"\n",
                _data(msg.encode())]
         if self._lineage_from:

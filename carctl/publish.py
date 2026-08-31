@@ -267,8 +267,48 @@ def _filter(stream: bytes, src: bytes, dst: bytes) -> bytes:
     return bytes(out)
 
 
+def _ensure_push_guard(repo: str) -> str:
+    """Make a bare `git push` from this repo fail instead of guessing.
+
+    `push.default` decides what `git push` with no refspec sends. Every value
+    except `nothing` picks branches for you, and the branch this repo is on is
+    main -- exact 10 Hz poses. One habitual `git push` in the wrong directory
+    is all it takes, and a push is the one step you cannot take back.
+
+    Set locally and only when the local config does not already say something.
+    An operator who wrote `push.default = simple` into THIS repo made a
+    decision about this repo and keeps it; a value merely inherited from
+    ~/.gitconfig is a global habit, and a repo that publishes a scrubbed copy
+    of a location feed must not inherit "push whatever matches".
+
+    What this deliberately does NOT do is pin `remote.<name>.push` refspecs.
+    Pinned refspecs would make a bare `git push` succeed -- publishing public
+    and lineage -- while BYPASSING audit() and audit_lineage() entirely. That
+    turns the guard into a shortcut around the gate. The job here is the
+    opposite: a bare push fails loudly, and `carctl publish --push`, which
+    audits first, stays the only path that reaches the remote.
+    """
+    have = subprocess.run(["git", "config", "--local", "--get", "push.default"],
+                          cwd=repo, capture_output=True, text=True,
+                          encoding="utf-8")
+    if have.returncode == 0 and have.stdout.strip():
+        return (f"push.default is already {have.stdout.strip()!r} in this "
+                "repo's config, left as the operator set it")
+    r = subprocess.run(["git", "config", "--local", "push.default", "nothing"],
+                       cwd=repo, capture_output=True, text=True,
+                       encoding="utf-8")
+    if r.returncode != 0:
+        raise RuntimeError("could not set push.default=nothing, so a bare "
+                           f"`git push` here is not guarded: {r.stderr.strip()}")
+    return "push.default set to nothing"
+
+
 def build_public_ref(repo: str, src: str = "refs/heads/main",
                      dst: str = "refs/heads/public") -> str:
+    # Before the ref exists, not after. The window where a scrubbed copy of
+    # main sits in a repo whose bare push still guesses at branches is the
+    # window this guard exists to close.
+    _ensure_push_guard(repo)
     exported = subprocess.run(["git", "fast-export", src], cwd=repo,
                               capture_output=True, check=True).stdout
     rewritten = _filter(exported, src.encode(), dst.encode())
@@ -385,16 +425,104 @@ def audit(repo: str, ref: str = "refs/heads/public") -> list[str]:
     return problems
 
 
+def audit_lineage(repo: str, ref: str = lineage.REF) -> list[str]:
+    """The same gate, for the ref that is pushed alongside public.
+
+    "Publishable by construction" was an argument, not a check. Lineage was
+    built by a different code path from public -- gitstore and lineage.backfill
+    write it directly, no fast-export filter anywhere near it -- so nothing
+    ever confirmed the construction held, and the personal committer address
+    rode out on every lineage commit that has ever been pushed.
+
+    audit() cannot be pointed at this ref: it requires the four frame paths and
+    refuses a ref it does not recognise, and lineage carries exactly one file.
+    So the three channels get checked here in the shape lineage actually has:
+
+      identity  every author and committer is PUBLIC_IDENT
+      tree      nothing but models.json, and each blob parses as a checkpoint
+                dict -- the same proof-of-shape scrub_models demands, because
+                an unreadable payload on this ref is a payload nobody checked
+      message   no Pose: trailer anywhere; this ref is kept forever, so a pose
+                on it is the one thing that must never be here
+
+    Raises AuditError if it cannot complete, for the reason audit() does:
+    "clean" and "never looked" must not be the same answer.
+    """
+    _git_out(repo, "rev-parse", "--verify", ref)
+    problems = []
+    idents = _git_out(repo, "log", "--format=%an <%ae>%n%cn <%ce>", ref)
+    for who in sorted({i for i in idents.split("\n") if i.strip()}):
+        if who.encode() != PUBLIC_IDENT:
+            problems.append(f"identity {who!r} is not the public identity")
+    bodies = _git_out(repo, "log", "--format=%B", ref)
+    # Any line opening with the trailer keyword, not _POSE_TEXT's shape. A
+    # malformed Pose: line is still a pose that got here, and the ref this
+    # gate protects is the one nothing ever prunes.
+    if any(line.startswith("Pose:") for line in bodies.splitlines()):
+        problems.append("a commit message on this ref carries a Pose: line, "
+                        "on the one ref that is kept forever")
+    # rev-list --objects names every object with the path it appears at; root
+    # trees come back with an empty name. Anything else named is a second file
+    # or a subdirectory, i.e. a channel nobody decided about.
+    blobs = []
+    for line in _git_out(repo, "rev-list", "--objects", ref).splitlines():
+        oid, _, name = line.partition(" ")
+        if not name:
+            continue
+        if name != "models.json":
+            problems.append(f"{name!r} is in a tree on this ref, which is "
+                            "supposed to carry models.json and nothing else")
+        else:
+            blobs.append(oid)
+    if not blobs:
+        raise AuditError(f"{ref} exposes no models.json at all; refusing to "
+                         "bless a ref this does not understand")
+    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=repo,
+                           input=("\n".join(blobs) + "\n").encode(),
+                           capture_output=True)
+    if batch.returncode != 0:
+        raise AuditError("`git cat-file --batch` failed: "
+                         + batch.stderr.decode("utf-8", "replace").strip())
+    # Aggregated, like _blob_problems: a ref with 300 unreadable entries is one
+    # defect reported once, not 300 lines nobody reads to the end of.
+    bad: dict[str, list] = {}
+    buf, pos = batch.stdout, 0
+    while pos < len(buf):
+        eol = buf.find(b"\n", pos)
+        if eol == -1:
+            break
+        header = buf[pos:eol].split()
+        pos = eol + 1
+        if len(header) != 3:
+            raise AuditError(f"unexpected cat-file header {buf[:eol]!r}")
+        oid, size = header[0].decode(), int(header[2])
+        try:
+            scrub_models(buf[pos:pos + size])
+        except Unscrubbable as exc:
+            seen = bad.setdefault(str(exc), [0, oid])
+            seen[0] += 1
+        pos += size + 1
+    problems += [f"models.json on this ref is not a checkpoint set: {why} "
+                 f"({n} of {len(blobs)} blobs, e.g. {oid[:12]})"
+                 for why, (n, oid) in sorted(bad.items())]
+    return sorted(set(problems))
+
+
 def push(repo: str, remote: str = "origin") -> tuple[bool, str]:
-    """Push the public ref, and lineage alongside it. The refspec is pinned in
-    .git/config too, so a bare `git push` cannot reach main by accident.
+    """Push the public ref, and lineage alongside it.
 
     Lineage goes because it is publishable by construction: it was designed to
     carry no pose precisely so it could be kept forever, and a clone without
     it answers every blame from the provisional main path -- shipping the
     scrubbed frames while withholding the one ref that explains them would
     publish the puzzle and keep the answer.
+
+    Both refs are audited, by their own gates. Auditing only public and
+    pushing lineage verbatim was the same "publishable by construction"
+    reasoning the whole public ref exists to distrust, and it shipped the car
+    owner's address on every lineage commit.
     """
+    _ensure_push_guard(repo)
     try:
         problems = audit(repo)
     except AuditError as exc:
@@ -404,6 +532,22 @@ def push(repo: str, remote: str = "origin") -> tuple[bool, str]:
     refspecs = ["refs/heads/public:refs/heads/main"]
     if subprocess.run(["git", "rev-parse", "--verify", "--quiet", lineage.REF],
                       cwd=repo, capture_output=True).returncode == 0:
+        try:
+            lineage_problems = audit_lineage(repo)
+        except AuditError as exc:
+            return False, ("the lineage audit could not complete, nothing "
+                           f"pushed: {exc}")
+        if lineage_problems:
+            # The whole push, not just the lineage half. Pushing public alone
+            # and reporting the lineage failure would publish the puzzle and
+            # keep the answer, which is the thing this pair exists to avoid --
+            # and it would do it while calling itself a partial success.
+            return False, ("lineage audit failed, nothing pushed:\n  "
+                           + "\n  ".join(lineage_problems)
+                           + "\n  `carctl lineage --rebuild` rewrites the ref "
+                             "from main with the public identity; entries "
+                             "written before that identity was adopted still "
+                             "carry the car's own address")
         refspecs.append(f"{lineage.REF}:{lineage.REF}")
     r = subprocess.run(
         ["git", "push", remote, *refspecs],

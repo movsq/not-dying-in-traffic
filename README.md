@@ -36,8 +36,11 @@ There are two planes and they are allowed to disagree.
 `git commit` forks a process, execs, builds an index and fsyncs. Tens of
 milliseconds, with a tail you cannot bound. Nothing like that belongs inside a
 100 ms safety deadline, so the loop never calls git at all. It puts a frame on
-a bounded queue and gets on with driving. That enqueue costs 25 us in the worst
-case I measured over a 170 frame drive.
+a bounded queue and gets on with driving. That enqueue costs tens of
+microseconds in the worst case -- 24.5 us on the Windows drive quoted below,
+between 20 and 50 us across repeated Linux drives, and 1.9 ms with the
+committer deliberately SIGSTOPped for the whole drive, which is still 50x
+inside the budget.
 
 A committer thread drains the queue into one long-lived `git fast-import`
 process, which appends commits over a pipe and never touches the index or a
@@ -180,13 +183,19 @@ having no revert.
 When a frame does get as far as the reachability check, that check compares the
 driven path against the lidar rather than the straight line. A car cannot
 translate sideways, so returning to a pose off to one side means driving a
-curve: across the scripted left turn the chord is 16.12 m and the arc is
-18.42 m, and the old test was asking for 2.3 m less room than the manoeuvre
-needs. It reads `lidar_min_bearing` now, which was written every frame and read
-by nothing, so a return 0.4 rad off the path no longer refuses a clear one. And
-a lidar sitting at its 40 m range limit is no longer reported as "occupied at
-40.0 m". Not seeing anything as far as you can see is not the same as seeing
-that it is clear, and the two deserve different answers.
+curve: across the scripted left turn the chord is 15.93 m and the driven path
+is 18.45 m. The one-arc model the check uses prices it at 17.18 m -- about
+half the deficit recovered, with the S-curve remainder left to the clearance
+margin rather than papered over by a multiplier tuned on this one turn, which
+would be wrong on every other geometry and wrong in the unsafe direction on a
+tighter one. `lidar_min_bearing` gates the forward cone, so a forward return
+0.4 rad off the path does not refuse a clear one -- with the caveat, learned
+by asking what actually calls this, that a revert's goal is the parent frame,
+which is always behind, and the rear channel carries no bearing and so counts
+as on-path: the conservative reading of not knowing. And a lidar sitting at
+its 40 m range limit is no longer reported as "occupied at 40.0 m". Not
+seeing anything as far as you can see is not the same as seeing that it is
+clear, and the two deserve different answers.
 
 ## Blame
 
@@ -256,13 +265,21 @@ to land, because you want to find the first bad drive, not some arbitrary frame
 in the middle of one. `carctl bisect` writes the script out and stops there:
 
 ```
-6 tagged drives, drive-0001 .. drive-0006
+2 tagged drives, drive-0007 .. drive-0008
 
-git -C C:/Users/fixed/not-dying-in-traffic bisect start drive-0006 drive-0001
-git -C C:/Users/fixed/not-dying-in-traffic bisect run carctl replay --assert-no-incident
+git -C /home/fixed/not-dying-in-traffic bisect start drive-0008 drive-0007
+git -C /home/fixed/not-dying-in-traffic bisect run carctl replay --assert-no-incident
 
 emitted, not run. bisecting a moving vehicle is not a thing.
 ```
+
+(Tags never leave a clone -- the push refspecs carry branches, not tags -- so a
+fresh clone has none until it drives, and the counter continues from the
+`Drive:` trailers on the lineage ref rather than restarting at drive-0001.
+That is why the first drive on this clone is drive-0007: origin's lineage
+already says drives 0001..0006 happened, and reusing a number would make
+"during drive-0006" permanently ambiguous on the one ref that is never
+pruned.)
 
 `carctl replay` is what makes the script actually runnable. At each bisect
 step git leaves one frame's files in the working tree; replay reads that
@@ -299,24 +316,31 @@ git stash pop  -> CONFLICT
   conflict: gap shrank 6.10m -> 5.40m
   conflict: vehicle behind moved
   conflict: clearance 0.22m below margin
-  -> stash kept, replanning attempt 2
+  -> stash kept, replanning attempt 2 (the gap is not the gap it was)
 ```
 
 A stash that cannot notice that conflict is worse than no stash, because it
 confidently replays a plan built for a world that is gone.
 
-The TTL runs on wall clock, not the simulated one. Simulated time restarts at
-zero in each process, so an entry saved an hour ago used to compute an age of
-0.0 s and pass the freshness check. `carctl park` also sweeps expired entries
-before it starts, because the normal outcome of a parking attempt is a conflict
-with the stash kept, and nothing was ever retiring them.
+The TTL runs on wall clock, always. Simulated time restarts at zero in each
+process, so an entry saved an hour ago used to compute an age of 0.0 s and
+pass the freshness check. `carctl park` also sweeps expired entries before it
+starts, because the normal outcome of a parking attempt is a conflict with the
+stash kept, and nothing was ever retiring them.
 
-The fix for that was itself wrong for a while, in a way I liked. "Same process"
-was inferred from the monotonic delta being positive and under an hour, which
-is exactly what a restart also produces, since the monotonic clock comes back
-up at zero. A 44 s old stash reported 7.6 s and popped clean. Entries carry the
-id of the process that wrote them now, so it is an identity check rather than a
-plausible looking guess.
+That took three tries, each wrong in a way I liked. "Same process" was first
+inferred from the monotonic delta being positive and under an hour, which is
+exactly what a restart also produces, since the monotonic clock comes back up
+at zero: a 44 s old stash reported 7.6 s and popped clean. So entries carried
+the id of the process that wrote them, an identity check instead of a
+plausible-looking guess -- and the identity check was arbitrating between two
+clocks, one of which was not a clock. `t_mono_ns` is the tick count: simulated
+time, which stops when the loop does, so inside one long-lived process a stash
+an hour old by every real measure reported 2.0 s and popped clean through the
+branch that was supposed to be the trustworthy one. There is one clock now.
+The wall stamps carry whole seconds, so ages read one second high on purpose:
+a TTL wants the upper bound, and against 45 s there is nothing worth missing
+in the finer clock.
 
 The conflict check also reads all four facts it stores. It skipped
 `lead_vehicle_x` entirely, so the car in front could roll back into the gap and
@@ -330,8 +354,15 @@ a tight gap is smaller than an absolute tolerance sized for a roomy one.
 ## The red button
 
 `git revert --hard` is not a git command. The button is not one either. It
-freezes the record at the last reversible frame and runs a minimal risk
-manoeuvre. It is guarded by a same-origin check and a token minted at startup
+freezes the displayed record at the last reversible frame and runs a minimal
+risk manoeuvre; the frames after the freeze point are handed to the incident
+tooling as suspect. The dashboard is a display over its own simulated drive --
+it moves no refs and reverts nothing, which its page now also says. The
+freeze point respects the one-way door: once a drive has produced an
+irreversible frame, the last-good seq stops advancing for the rest of that
+drive, because `!` means the history stops being invertible from there on and
+a freeze point past it would be an offer to walk back through the curb
+strike. It is guarded by a same-origin check and a token minted at startup
 that only ever reaches the served page. Binding to localhost is not access
 control, and a plain form POST from any other page in the same browser is a
 CORS simple request that nothing preflights. Halting a vehicle should take more
@@ -344,7 +375,11 @@ unchecked. `GET /` handed the real token to any `Host` that asked for it, and
 blocking DNS rebinding was not on the requests that get rebound, which is the
 kind of thing you only notice by asking what actually calls it. Reads are
 checked now -- and the check runs before the route match, so an unauthorised
-POST cannot even probe which routes exist. The route match ignores the query
+POST cannot even probe which routes exist. Methods the server does not
+implement get the same treatment: HEAD answers like GET behind the Host
+check, and PUT, DELETE, OPTIONS and PATCH are refused after it, because the
+inherited 501 used to fire before any guard, so "applied to every route" was
+only true of the routes that existed. The route match ignores the query
 string and case, because `/?v=2` used to miss the token substitution and fall
 through to the static file handler, which served the page with the placeholder
 still in it: a dashboard that streams, looks completely healthy, and refuses
@@ -384,10 +419,15 @@ that disagree.
 ```
 are you sure? this cannot be undone (physically)
 
-Record plane: rolls back 67 frame(s) to seq 109.
+Record plane: freezes at seq 107 -- the 30 frame(s) after it
+are handed to the incident tooling as suspect.
 Physical plane: rolls back 0 m. The vehicle will run a
 minimal-risk manoeuvre and stop where it is.
 ```
+
+(107, whenever the click comes after the seq 108 near miss: that is the last
+reversible frame before the drive's first one-way door, and the latch holds
+there however long the drive runs on.)
 
 That second number is always 0 m. I think showing it is the most useful thing
 on the whole dashboard. The numbers in the dialog are a prediction made at the
@@ -468,19 +508,38 @@ not exist got you "nothing wrong". It raises now. A gate that answers the same
 way when it passes and when it never ran is worse than no gate, because only
 one of those two readings is true and you cannot tell which one you got.
 
-`lineage` is pushed alongside `public`. It is publishable by construction: it
-was designed to carry no pose precisely so it could be kept forever, and a
-clone without it answers every blame from the provisional `main` path.
-Shipping the scrubbed frames while withholding the one ref that explains them
-would publish the puzzle and keep the answer.
+`lineage` is pushed alongside `public`. It was designed to carry no pose
+precisely so it could be kept forever, and a clone without it answers every
+blame from the provisional `main` path. Shipping the scrubbed frames while
+withholding the one ref that explains them would publish the puzzle and keep
+the answer.
 
-The push refspecs are pinned in `.git/config` to
-`refs/heads/public:refs/heads/main` and `refs/heads/lineage:refs/heads/lineage`,
-and `push.default` is `nothing`, so a bare `git push` cannot reach `main` by
-accident.
+"Publishable by construction" turned out to be an argument, not a check, and
+the argument only covered pose. Lineage is written by gitstore and
+`lineage --backfill`, nowhere near the fast-export filter, so nothing ever
+scrubbed its identities -- and the personal committer address rode out on
+every lineage commit that was ever pushed, the same channel the filter exists
+to strip from `public`. Construction is honest now: lineage commits are
+written with the fleet identity at the only place they are ever written, and
+the push runs a lineage-shaped audit -- identity, tree, messages -- beside
+the public one, refusing the whole push if either fails. A ref written before
+that change still carries the address; `carctl lineage --rebuild` is the
+migration, since the entries are derived from `main` and rewriting them costs
+nothing but the identity line. Rewriting the copy already on the remote is a
+push away once the local ref is rebuilt.
 
-Nothing has been pushed yet. The repo is private, which lowers the stakes but
-does not change the design. Publishing stays a thing you type on purpose:
+There are no pinned push refspecs, deliberately. Pinned refspecs would make a
+bare `git push` succeed -- publishing `public` and `lineage` while walking
+straight past both audit gates. Instead `carctl publish` sets `push.default`
+to `nothing` in the repo it runs in (unless the local config already says
+something on purpose), so a bare `git push` fails loudly, and
+`carctl publish --push`, which audits first, is the only path that reaches
+the remote.
+
+The scrubbed `public` and the lineage ref have been pushed -- a clone of this
+repository lands on the scrubbed copy as its `main`, which is what makes the
+clone safe to hand out. The repo is private, which lowers the stakes but does
+not change the design. Publishing stays a thing you type on purpose:
 
 ```bash
 python -m carctl publish --push
@@ -550,22 +609,35 @@ carctl maintain --days 0
 
 stationary check: stopped, last frame reports 0.4 km/h
 window: 0 day(s) (--days)
-cut at 75212b6012 (0 frame(s) inside the 0 day window; held back to the
-                   start of the most recent drive)
-dropping 170 of 340 frame(s)
+cut at 80a3db9b09 (170 frame(s) inside the 0 day window; held back to the start of the most recent drive)
+dropping 1210 of 1380 frame(s)
 dropping 3 ref(s) that reach below the cut
+  still holds dropped frames (remote-tracking; retention cannot reclaim these objects -- `git update-ref -d <ref>` or repoint the remote if this clone's disk matters): refs/remotes/origin/HEAD
+  still holds dropped frames (remote-tracking; retention cannot reclaim these objects -- `git update-ref -d <ref>` or repoint the remote if this clone's disk matters): refs/remotes/origin/main
 rebuilt refs/heads/public from the pruned main
 expiring the reflogs of HEAD, refs/heads/main, refs/heads/public
-pack 0.4 MB -> 0.3 MB
+pack 0.9 MB -> 0.6 MB
 commit-graph dropped, not rebuilt: git does not write one for a shallow repository
 multi-pack-index rewritten
 ```
 
+The remote-tracking lines are a clone telling the truth about itself: a ref
+is what keeps objects alive, and `refs/remotes/origin/main` pins every frame
+this pass just dropped, so on a clone the pack line barely moves until you
+decide about the tracking refs too. They used to be filed under "somebody's
+safety copy", which is an operator decision, and a clone's own bookkeeping is
+not one. On the car -- no remote-tracking refs -- the drop is the whole
+story.
+
 The `window:` line names where the number came from -- the flag, the
 `CARCTL_WINDOW_DAYS` environment variable, or the default -- because the
 window decides which frames stop existing, and ambient configuration that can
-shorten it has to be visible in the report it shortened. A garbled value in
-the environment is refused loudly rather than silently falling back to 14.
+shorten it has to be visible in the report it shortened. A garbled value is
+refused loudly rather than silently falling back to 14, from either source:
+the environment must be a positive number, and `--days` a finite one, zero or
+more -- zero from a flag is an operator's explicit decision for one pass,
+zero from the environment would be a standing config that wipes every drive
+on every pass, so the two are held to different rules on purpose.
 
 The refs go because a ref is what keeps objects alive, and a leftover revert
 anchor holds a whole chain of frames behind a commit that is on no branch at
@@ -588,7 +660,13 @@ repack, and any of those later steps can fail -- a pack held open by a virus
 scanner is the usual Windows way. The report that failure interrupts survives
 it, marked as a prune that failed partway with the refs already gone, because
 "not pruned" and "half pruned" need opposite responses and the operator only
-gets to pick the right one if the report can tell them apart.
+gets to pick the right one if the report can tell them apart. The exit code
+says the same thing: a pass that got past the point of no return and then
+stopped exits non-zero with the full report, so a cron line cannot read "half
+pruned" as success. That catch is for any exception, not just this module's
+own -- the public rebuild inside the destructive window raises the publish
+module's types, and letting those out as tracebacks was exactly the bare "not
+pruned" this paragraph promises not to give you.
 
 The last line of that output is the price. Git will not write a commit-graph
 for a shallow repository, so once `main` has been pruned there is no
@@ -619,27 +697,36 @@ scenario the bounded queue drops frames on, so repacking mid-drive would
 manufacture the failure the architecture exists to survive. The lock is
 advisory in one direction only. It never blocks a drive, and it expires by
 itself, so a power cut cannot leave a vehicle unable to repack until somebody
-walks up to it.
+walks up to it. The horizon it claims is capped at four hours whatever the
+drive declared -- `--seconds 1e9` plus a crash must not lock maintenance out
+until 2058, and a genuinely longer drive is still covered by the speed gate.
+Each lock carries a token, and a drive only removes the lock it wrote: two
+overlapping drives used to let whichever finished first delete the lock the
+other was still protected by.
 
 ## Running it
 
 Python 3.9 or newer and `git` on `PATH`. No third party packages, no build
 step. Written and run on Windows against 3.14.
 
-It runs unchanged on Linux, as far as can be checked without a Linux box in
-front of me. There is exactly one platform branch in the tree, the
-`allow_reuse_address` line in `dashboard/server.py`, and its Linux value is
-`True`, which is what `http.server.HTTPServer` sets by default anyway: the
-branch exists to take the Windows behaviour away, not to add anything
-elsewhere. Nothing else in the tree touches a platform API, no path is built
-by hand, no source path differs only by case, and every text-mode subprocess
-call names `encoding="utf-8"` explicitly, so a `LANG=C` shell cannot mangle
-the street names. The one version floor is `git` 2.32 for
+It has now been executed on Linux, and the first execution disagreed with
+this section in more places than the code did -- the loop, the committer and
+the whole drive pipeline ran unchanged, and the max jitter came out 0.03 ms
+against 0.64 on Windows. There are two platform branches in the tree now: the
+`allow_reuse_address` line in `dashboard/server.py`, whose Linux value is
+`True`, which is what `http.server.HTTPServer` sets by default anyway, and
+the process-group detach in `gitstore.py`, which is `start_new_session` on
+POSIX and a CreateProcess flag on Windows because the two platforms have no
+shared spelling for "not in the terminal's group". Both exist to take a
+behaviour away, not to add one. Nothing else in the tree touches a platform
+API, no path is built by hand, no source path differs only by case, and every
+text-mode subprocess call names `encoding="utf-8"` explicitly, so a `LANG=C`
+shell cannot mangle the street names. The one version floor is `git` 2.32 for
 `repack --geometric`; older git takes the full repack instead and says so.
-What I have not done is execute it on Linux.
 
-A fresh clone lands on `main`, which is drive data and contains no source. The
-code is on `src`:
+A fresh clone lands on `main`, which is drive data -- the scrubbed public
+copy, since that is what was published -- and contains no source. The code is
+on `src`:
 
 ```bash
 git clone https://github.com/movsq/not-dying-in-traffic.git
@@ -657,7 +744,16 @@ python -m carctl drive
 The default drive is 17 s: long enough to run the whole script and come to
 rest, which matters because `maintain` reads the last committed frame's speed
 and refuses to touch the disk under a car that is still rolling. A drive cut
-short ends moving, and maintenance then waits for one that did not.
+short ends moving, and maintenance then waits for one that did not. Cutting
+one short is safe now from either direction: fast-import runs outside the
+terminal's process group, so a ^C -- which signals the whole group -- no
+longer kills the child mid-stream and costs the frames since the last
+checkpoint, and SIGTERM arrives as the same clean shutdown. An interrupted
+drive commits every frame it drove, prints its report, tags itself like any
+other, and exits 130 so a script can tell a prefix from the drive it asked
+for. The first drive on a clone also adopts origin's lineage ref before it
+reads it -- a clone materialises only `main`, and driving once used to orphan
+every published promotion by rooting a second lineage next to it.
 
 ```bash
 python -m carctl incident --kind red_light_run
@@ -688,23 +784,40 @@ python dashboard/server.py
 ```
 
 `pip install .` is optional and adds a `carctl` entry point on `PATH`, which
-is what the emitted bisect script calls; `python -m carctl` is the same thing
-without the install.
+is what the emitted bisect script calls. The repo every command operates on
+is the one containing your working directory, resolved fresh per invocation
+-- it used to be derived from where the package was installed, which after
+`pip install .` was site-packages, or worse, whichever repository happened to
+contain the venv, and 170 frames of drive data landing silently in an
+unrelated repo is the kind of bug you only get to be surprised by once.
+`python -m carctl` is the same thing without the install, with one exception:
+inside a `git bisect` checkout the working tree is a frame, not the source,
+so `python -m carctl` has nothing to import there and the emitted script
+needs the installed entry point.
 
 `drive` writes commits to `refs/heads/main` and `refs/heads/lineage` in
-whatever repo you run it from, and `incident` writes a revert under
-`refs/reverts/`. Neither touches a remote. `publish` rebuilds
-`refs/heads/public` locally and stops there; it needs `--push` to reach the
-network, and the audit gate runs first either way.
+whatever repo you run it from -- and refuses if that repo's `main` is not a
+frame history, because frames are appended onto the tip's tree and driving
+with source checked into `main` would stamp `carctl/` into every frame
+commit. `incident` writes a revert under `refs/reverts/`. Neither touches a
+remote. `publish` rebuilds `refs/heads/public` locally and stops there; it
+needs `--push` to reach the network, and the audit gates -- public and
+lineage both -- run first either way. On a clone whose lineage predates the
+public-identity change, that gate will tell you to run
+`carctl lineage --rebuild` once before the first publish.
 
 `maintain` deletes frames, so start with `--dry-run`. A fresh drive writes its
 own lineage entries, so a repo born under this code is always prunable; a repo
 whose history predates the lineage ref will refuse to prune until you have run
 `carctl lineage --backfill`, which is the right order: the promotions on
 `main` are the evidence, and they have to be somewhere else before `main`
-goes.
+goes. (On a clone the first drive seeds the ref from origin by itself, so the
+gate is normally already satisfied; `--rebuild` is for replacing a ref that
+exists and is wrong.)
 
 ## Numbers from a real 17 s drive
+
+Captured on Linux, from the first drive on a fresh clone:
 
 ```
 ticks           170
@@ -712,11 +825,11 @@ committed       170
 dropped frames  0
 promotions      2   <- commits on refs/heads/lineage
 deadline overruns 0
-max jitter      0.64 ms
-max submit cost 24.5 us   <- the loop's entire git bill
-tagged as      drive-0006
+max jitter      0.03 ms
+max submit cost 22.4 us   <- the loop's entire git bill
+tagged as      drive-0007
 
-incidents: 5 across 4 kind(s)
+incidents: 4 across 4 kind(s)
   off_road        first at seq  102  lateral offset -1.79 m from Ječná:2.6
                   owner: planner
   collision       first at seq  108  clearance=1.43 m
@@ -726,6 +839,21 @@ incidents: 5 across 4 kind(s)
   curb_strike     first at seq  131  az=50.8 m/s^2
                   owner: controller
 ```
+
+The same drive on Windows reported a max jitter of 0.64 ms -- twenty times
+this box's 0.03 -- and identical everything else, which is the portability
+claim above in one line. Under `--fast` the jitter and overrun lines read
+"not measured" instead of zero: nothing was scheduled against a deadline, and
+a zero that was never measured reads exactly like a clean result on the two
+numbers this loop exists to produce.
+
+This block used to say 5 incidents across 4 kinds. The fifth was 21
+consecutive frames of `collision` starting at seq 149 -- the car successfully
+parked, stationary at 0.4 km/h, 1.40 m behind the van it had deliberately
+parked behind, charged to prediction and invisible under a report that prints
+one line per kind. A near miss is a kinematic event, so the detector now
+requires the car to be moving, on the same 1.0 m/s floor `red_light_run`
+already used for the same question.
 
 That overrun count used to read 1, on every drive I ever ran, sitting directly
 above a max jitter of 0.62 ms. A 0.62 ms jitter cannot miss a 100 ms deadline,

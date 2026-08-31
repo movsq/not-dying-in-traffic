@@ -184,7 +184,18 @@ def backfill(repo: str, ref: str = REF, source: str = "refs/heads/main",
     if r.returncode != 0:
         return 0, f"cannot read {source}: {r.stderr.strip()}"
 
-    from .gitstore import IDENT, _data, _tz_offset   # same stream format
+    from .gitstore import _data, _tz_offset          # same stream format
+    # The public identity, not the car's own. This is the ref designed to
+    # outlive the frames and leave the vehicle -- it is pushed beside public
+    # and kept forever -- so it is written publishable from the start rather
+    # than scrubbed on the way out; there is no fast-export filter on this
+    # path to scrub it. main keeps the personal identity deliberately: that
+    # one stays in the car. Imported here rather than at module scope because
+    # publish imports this module, and a module-level import back would be a
+    # cycle. It also makes `carctl lineage --rebuild` the migration for a ref
+    # written before this was true: the entries are derived from main, so
+    # rewriting them costs nothing but the identity line.
+    from .publish import PUBLIC_IDENT
 
     # No `from` line anywhere in this stream: the first commit roots the ref
     # and fast-import parents the rest on what it is already tracking. A
@@ -207,7 +218,7 @@ def backfill(repo: str, ref: str = REF, source: str = "refs/heads/main",
         prev = content
         msg = message(changed, ct, _drive_of(repo, sha), _seq_of(repo, sha))
         stream.append(b"commit " + ref.encode() + b"\n")
-        stream.append(b"committer " + IDENT + b" %d " % ct
+        stream.append(b"committer " + PUBLIC_IDENT + b" %d " % ct
                       + _tz_offset(ct) + b"\n")
         stream.append(_data(msg.encode()))
         stream.append(b"M 100644 inline models.json\n")

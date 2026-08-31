@@ -46,7 +46,7 @@ stalled-disk scenario the bounded queue drops frames on, so repacking during a
 drive would manufacture the failure the architecture exists to survive.
 """
 from __future__ import annotations
-import contextlib, json, math, os, stat, subprocess, time
+import contextlib, json, math, os, stat, subprocess, time, uuid
 from . import lineage, publish
 
 MAIN_WINDOW_DAYS = 14
@@ -60,6 +60,14 @@ LOCK_NAME = "carctl-drive.lock"
 # mid-drive must not leave a file behind that blocks maintenance forever on a
 # vehicle with nobody in it.
 LOCK_GRACE_S = 60.0
+# Ceiling on how far ahead a lock may claim the disk, whatever it declares. A
+# typo'd `--seconds 1e9` plus a crash otherwise blocks every maintenance pass
+# until 2058, on a vehicle nobody is sitting in, and the record plane must not
+# be able to lock itself out of its own housekeeping on one bad digit. Four
+# hours is longer than any drive this thing does; a genuinely longer one is
+# still covered, because stationary() reads the last frame's speed as a second
+# and independent signal and a moving car fails that gate on its own.
+LOCK_MAX_S = 4 * 3600.0
 # `git repack --geometric` landed in 2.32. Everything else here works on the
 # git that ships with a 2020 distribution, so this is the one version gate,
 # and it degrades rather than refusing.
@@ -115,9 +123,19 @@ def drive_lock(repo: str, seconds: float):
     by a crash would do exactly that.
     """
     path = lock_path(repo)
+    # `seconds` is what the drive declared and stays in the file as written --
+    # drive_in_progress reports it and old locks carry it -- but the horizon it
+    # buys is capped. The two numbers disagreeing is the honest reading: this
+    # is what you asked for, this is how long we will hold the disk for it.
+    token = uuid.uuid4().hex
     body = json.dumps({"pid": os.getpid(),
-                       "until": time.time() + seconds + LOCK_GRACE_S,
-                       "seconds": seconds})
+                       "until": time.time() + min(seconds, LOCK_MAX_S)
+                                + LOCK_GRACE_S,
+                       "seconds": seconds,
+                       # Additive. drive_in_progress reads pid/until/seconds
+                       # and never looks here, so a lock written by an older
+                       # build still reads and still blocks correctly.
+                       "token": token})
     try:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(body + "\n")
@@ -130,8 +148,29 @@ def drive_lock(repo: str, seconds: float):
         yield
     finally:
         if path:
-            with contextlib.suppress(OSError):
-                os.remove(path)
+            _release_lock(path, token)
+
+
+def _release_lock(path: str, token: str) -> None:
+    """Remove the lock only if it is still ours.
+
+    Two drives overlapping both write this path, and the second one wins. The
+    unconditional remove that used to be here then let whichever drive
+    finished FIRST delete the lock the still-running one is protected by, so
+    maintenance was free to start a full repack under a moving vehicle -- the
+    exact stalled-disk scenario the bounded queue drops frames on.
+
+    Read-compare-delete, which is not atomic, and does not need to be: the
+    only way to lose the race is for the winner's own release to run between
+    our read and our unlink, and it deletes the same file we were about to.
+    Every failure mode is a lock left behind, and a lock left behind expires
+    on its own `until`.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        with open(path, encoding="utf-8") as fh:
+            if json.load(fh).get("token") != token:
+                return      # somebody else's drive owns this file now
+        os.remove(path)
 
 
 def drive_in_progress(repo: str) -> str:
@@ -189,8 +228,27 @@ def resolve_window_days(days: float | None) -> tuple[float, str]:
     reverting to 14 would be the one outcome nobody notices, and the failure it
     hides -- a window shortened or garbled by ambient config -- destroys frames
     that were meant to be kept.
+
+    The flag is checked too, and used not to be: argparse's `type=float` takes
+    `nan` and `-1e9` as perfectly good floats, so `--days -1e9` set a horizon
+    before the epoch and `--days nan` made every comparison below false and
+    tracebacked somewhere further in. A number that decides what is destroyed
+    does not get to arrive unchecked from either source.
+
+    The two sources are checked to different rules, deliberately. Zero is
+    rejected from the environment and accepted from the flag: a standing
+    CARCTL_WINDOW_DAYS=0 is a deployment-wide instruction to wipe every drive
+    on every pass, which is the kind of thing that gets set once and forgotten,
+    while `--days 0` is an operator typing a one-shot decision at a prompt --
+    and window_cut holds it back to the start of the most recent drive anyway.
     """
     if days is not None:
+        if not math.isfinite(days) or days < 0:
+            raise MaintenanceError(
+                f"--days {days:g} is not a usable retention window; it must "
+                "be a finite number of days, zero or more. A window decides "
+                "which frames are destroyed, so a garbled one is refused here "
+                "rather than turned into a horizon nothing survives")
         return days, "--days"
     raw = os.environ.get(WINDOW_ENV)
     if raw is None or not raw.strip():
@@ -245,8 +303,15 @@ def _remove_cache(path: str) -> None:
     Git marks graph and pack files read-only, and Windows refuses to unlink a
     read-only file: shutil.rmtree(ignore_errors=True) therefore left the stale
     commit-graph exactly where it was and said nothing, which leaves a
-    repository `git fsck` calls broken. Clearing the bit first is a no-op on
-    POSIX, where the directory's write permission is what decides.
+    repository `git fsck` calls broken. Clearing the bit first is what makes
+    the unlink possible there.
+
+    On POSIX the chmod decides nothing -- the directory's write bit is what
+    permits an unlink -- so it is best-effort. Insisting on it turned a file
+    owned by another uid into a PermissionError on a delete that would have
+    succeeded, which is the chmod failing the deletion it exists to enable.
+    It also narrows the mode as a side effect, and a mode we changed on a file
+    we then failed to remove is a change nobody asked for.
     """
     if not os.path.lexists(path):
         return
@@ -255,8 +320,9 @@ def _remove_cache(path: str) -> None:
             _remove_cache(os.path.join(path, name))
         os.rmdir(path)
         return
-    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
-    os.remove(path)
+    with contextlib.suppress(OSError):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    os.remove(path)     # the real operation, and the one that reports
 
 
 def refresh_commit_graph(repo: str) -> str:
@@ -410,6 +476,29 @@ def _reaches_dropped(repo: str, cut: str, pattern: str) -> list[str]:
     return out
 
 
+def _is_remote_tracking(ref: str) -> bool:
+    return ref.startswith("refs/remotes/")
+
+
+def _stray_note(ref: str) -> str:
+    """How a ref that still reaches below the cut gets described.
+
+    "left alone: somebody's safety copy" is true of refs/backup/* and false of
+    refs/remotes/*, and filing the second under the first is the difference
+    between an operator decision and this clone's own bookkeeping. A clone
+    fetched origin's main and its tracking ref pins every object main just
+    dropped, so the pack barely moves and the report says the pass respected
+    somebody's choice -- a choice nobody made. Named accurately, with the
+    command, because reclaiming the disk here is a decision about the remote
+    and retention has no business making it silently either way.
+    """
+    if _is_remote_tracking(ref):
+        return ("still holds dropped frames (remote-tracking; retention "
+                "cannot reclaim these objects -- `git update-ref -d <ref>` or "
+                f"repoint the remote if this clone's disk matters): {ref}")
+    return f"left alone, still holds dropped frames: {ref}"
+
+
 def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
           dry_run: bool = False) -> tuple[list[str], bool]:
     """Drop frames older than the window off refs/heads/main.
@@ -422,7 +511,7 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
         raise MaintenanceError(
             f"{lineage.REF} does not exist, so the promotions on main are "
             "recorded nowhere else and pruning would destroy them. Seed it "
-            "with `carctl lineage --backfill` first")
+            "with `carctl lineage --backfill` first", report=report)
     cut, note = window_cut(repo, days)
     report.append(f"cut at {cut[:10]} ({note})")
     total = int(_out(repo, "rev-list", "--count", "refs/heads/main").strip())
@@ -441,7 +530,12 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
             f"them (e.g. blob {gaps[0][:10]}). Pruning would destroy the only "
             "record of when those models shipped. `carctl lineage "
             "--backfill` seeds an empty ref from them; `carctl lineage "
-            "--rebuild` replaces one that a drive has already written to")
+            "--rebuild` replaces one that a drive has already written to",
+            # The lines above -- where the cut fell and how many frames were
+            # at stake -- are the context that makes this refusal actionable.
+            # Reporting the gate alone told the operator that something was
+            # not pruned and nothing about what nearly was.
+            report=report)
 
     doomed = (_reaches_dropped(repo, cut, "refs/tags/drive-*")
               + _reaches_dropped(repo, cut, "refs/reverts/*")
@@ -455,9 +549,11 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
               if r not in doomed
               and r not in ("refs/heads/main", "refs/heads/public")]
     for r in strays:
-        report.append(f"  left alone, still holds dropped frames: {r}")
+        report.append("  " + _stray_note(r))
     for name, n in _oversized(repo, cut, keeping, doomed + strays):
-        report.append(f"  outside retention, {n} commits of its own: {name}")
+        report.append(f"  outside retention, {n} commits of its own: {name}"
+                      + (" (remote-tracking)" if _is_remote_tracking(name)
+                         else ""))
     if dry_run:
         report.append("dry run, nothing changed")
         return report, False
@@ -517,9 +613,24 @@ def prune(repo: str, days: float = MAIN_WINDOW_DAYS,
         _out(repo, "repack", "-a", "-d", "--unpack-unreachable=now")
         _out(repo, "prune", "--expire=now")
         report.append(f"pack {before} -> {_disk(repo)}")
-    except MaintenanceError as exc:
-        raise MaintenanceError(str(exc), report=report,
-                               destructive=True) from exc
+    except Exception as exc:
+        # Exception, not MaintenanceError. Everything in this block that is
+        # not a git call raises something else entirely: build_public_ref
+        # raises Unscrubbable for a path nobody has decided about and
+        # RuntimeError when fast-import fails, and the shallow file is plain
+        # open(). Catching only our own type let those out as raw tracebacks
+        # AFTER the doomed refs were deleted and the boundary was written --
+        # no report, and a full-length refs/heads/public left standing beside
+        # a pruned main, which is the one outcome that reclaims nothing and
+        # looks like a crash rather than a half-done job.
+        #
+        # Not BaseException: a KeyboardInterrupt or a SystemExit here is
+        # somebody stopping the process, and swallowing that into a report is
+        # how a Ctrl-C stops meaning stop.
+        raise MaintenanceError(
+            str(exc) if isinstance(exc, MaintenanceError)
+            else f"{type(exc).__name__}: {exc}",
+            report=report, destructive=True) from exc
     return report, True
 
 
@@ -532,6 +643,12 @@ def repack(repo: str, dry_run: bool = False) -> list[str]:
     small packs, which is what makes this affordable often enough to matter.
     """
     n = len(_packs(repo))
+    if not n:
+        # A repo whose objects are all loose, which is every repo before its
+        # first fast-import session. `git repack` succeeds and reports
+        # "0 pack(s) 0.0 MB -> 0 pack(s) 0.0 MB", which reads as a failure to
+        # do anything rather than as nothing to do.
+        return ["no packs yet, nothing to repack"]
     geometric = git_version(repo) >= MIN_GEOMETRIC_GIT
     how = "geometrically" if geometric else "in full, git is older than 2.32"
     if dry_run:
@@ -579,6 +696,13 @@ def maintain(repo: str, days: float | None = None,
     environment or the built-in default. Its MaintenanceError is deliberately
     not caught here: an unusable window is a reason not to start, and the
     caller reports it.
+
+    Returns the report when the pass finished, whatever it refused along the
+    way. Raises MaintenanceError with the FULL report attached when the prune
+    got past its point of no return, because a half-pruned repository that
+    exits 0 is the failure this whole module is written not to have: refs are
+    gone, the boundary is on disk, and the next thing to read that exit code
+    is a cron line that will never mention it again.
     """
     days, source = resolve_window_days(days)
     ok, why = stationary(repo)
@@ -591,6 +715,7 @@ def maintain(repo: str, days: float | None = None,
         report.append("refusing to touch the object store while the vehicle "
                       "is not stopped")
         return report
+    partway = None
     try:
         pruned, repacked = prune(repo, days, dry_run)
     except MaintenanceError as exc:
@@ -603,7 +728,10 @@ def maintain(repo: str, days: float | None = None,
             # here would be a lie in the direction that matters: refs are gone
             # and the boundary is written, so what the operator needs is the
             # account of how far it got and the fact that finishing the job is
-            # a re-run, not a repair.
+            # a re-run, not a repair. Held, not raised yet: the rest of the
+            # pass still has to run and still has lines worth reading, and
+            # they belong in the same report as this.
+            partway = exc
             pruned = exc.report + [
                 f"prune failed PARTWAY: {exc}",
                 "the doomed refs are already deleted and the shallow boundary "
@@ -611,7 +739,10 @@ def maintain(repo: str, days: float | None = None,
                 "unreachable but still on disk; once the cause above is "
                 "cleared, running maintain again finishes the job"]
         else:
-            pruned = [f"not pruned: {exc}"]
+            # exc.report first: it holds where the cut fell and how many
+            # frames were at stake, which is what makes a refusal something an
+            # operator can act on instead of a sentence about a gate.
+            pruned = exc.report + [f"not pruned: {exc}"]
     report += pruned
     if not repacked:
         try:
@@ -625,8 +756,20 @@ def maintain(repo: str, days: float | None = None,
         # Last, and after both halves: either can invalidate them.
         try:
             report.append(refresh_commit_graph(repo))
-            _out(repo, "multi-pack-index", "write")
-            report.append("multi-pack-index rewritten")
+            # `git multi-pack-index write` exits non-zero with "no pack files
+            # to index" on a repo whose objects are all still loose. That is
+            # git declining to write an index of nothing, not a cache refresh
+            # failing, and reporting it as one puts a scary line in the report
+            # of a pass where nothing was wrong.
+            if _packs(repo):
+                _out(repo, "multi-pack-index", "write")
+                report.append("multi-pack-index rewritten")
         except MaintenanceError as exc:
             report.append(f"cache refresh failed: {exc}")
+    if partway is not None:
+        # Everything the pass did is in `report` now, including the repack and
+        # cache lines above. The caller prints it and exits non-zero: a
+        # half-pruned repository must not be reported the way a clean one is.
+        raise MaintenanceError(str(partway), report=report,
+                               destructive=True) from partway
     return report

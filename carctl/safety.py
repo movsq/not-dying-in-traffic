@@ -35,8 +35,20 @@ IRREVERSIBLE_CLEARANCE = 2.0   # m; closer than this and the frame is one-way
 
 # A parallel park legitimately closes on the car behind. plant.py's own
 # comment calls that van "what the parking manoeuvre is squeezing in behind",
-# and MIN_CLEARANCE flagged the successful park as a collision.
-PARK_CLEARANCE = 0.5    # m; the floor even a parking manoeuvre must not cross
+# so MIN_CLEARANCE is not the right question to ask of a park frame; this is
+# the floor even a parking manoeuvre must not cross.
+PARK_CLEARANCE = 0.5    # m
+
+# A near miss is a kinematic event: it is about closing speed, not about
+# proximity. A stationary car is not colliding with anything, however close it
+# is parked, and there is no manoeuvre for it to have got wrong.
+#
+# The same 1.0 m/s red_light_run already uses as its floor for "moving",
+# deliberately: two different answers to "is this car in motion" inside one
+# detect() would be a defect of its own. It is also comfortably above the
+# 0.86 m/s the shipped drive is still doing at the first of its stop frames,
+# which is what the gate has to clear to work at all.
+COLLISION_MIN_SPEED = 1.0   # m/s (3.6 km/h)
 
 LIDAR_MAX_RANGE  = 40.0   # m; a return at exactly max range means "nothing seen"
 PATH_BEARING_TOL = 0.35   # rad; a return outside this cone is not on our path
@@ -89,13 +101,24 @@ def detect(f: Frame, true_light: str) -> list[Incident]:
     if f.sensors.imu_accel_z > CURB_ACCEL_Z:
         found.append(Incident("curb_strike", f.seq,
                               f"az={f.sensors.imu_accel_z:.1f} m/s^2"))
-    # Parking gets a tighter floor, not an exemption. A bare static threshold
-    # reported the successful park at seq 139 (1.40 m from the parked van at
-    # 2.6 m/s) as a collision and blamed prediction for a manoeuvre that went
-    # right; in the shipped drive that was invisible only because curb_strike
-    # happened to outrank it.
+    # Parking gets a tighter floor, not an exemption: a manoeuvre whose whole
+    # point is closing on the car behind must not be judged by the road's
+    # clearance, but it still has a limit, and PARK_CLEARANCE is it. It is a
+    # guard rather than an observed trigger -- the shipped parking manoeuvre
+    # never gets closer than 2.92 m in the forward cone (its minimum, at seq
+    # 139, doing 2.47 m/s), so nothing in this scenario can reach 0.5 m and
+    # the constant has never once fired here.
+    #
+    # What that leaves is the frames around a park, which are not park frames
+    # themselves and so take the road limit. Those are gated on motion
+    # below: the car FINISHES parking and then sits 1.40 m off the van it
+    # deliberately parked behind, and the 1.5 m road limit called each of
+    # those still frames a collision -- 21 consecutive phantom incidents, all
+    # of them charged to prediction, and invisible in a report that lists one
+    # line per kind.
     limit = PARK_CLEARANCE if f.maneuver == "park" else MIN_CLEARANCE
-    if f.sensors.lidar_min_range < limit:
+    if (f.sensors.lidar_min_range < limit
+            and f.pose.v > COLLISION_MIN_SPEED):
         found.append(Incident("collision", f.seq,
                               f"clearance={f.sensors.lidar_min_range:.2f} m"))
     if true_light == "red" and f.sensors.stop_line_crossed and f.pose.v > 1.0:
@@ -138,8 +161,18 @@ def _arc_length(dist: float, bearing: float, behind: bool) -> float:
     A car cannot translate sideways, so reaching a goal offset from straight
     ahead (or straight behind) means driving a curve, and the straight line
     understates it. Reverting seq 55 back to seq 25 across the scripted left
-    turn is 16.12 m of chord against 18.42 m of path, so the clearance test
-    was asking for 2.3 m less room than the manoeuvre actually needs.
+    turn is 15.93 m of chord against 18.45 m of driven path, so the clearance
+    test was asking for 2.5 m less room than the manoeuvre actually needs.
+
+    This returns 17.18 m for that case, not 18.45. The model is a single
+    constant-radius arc and the real return is an S: out of the turn, then
+    back into the lane. So it recovers about half the deficit and still
+    understates the path by ~1.3 m. That residual is deliberately left to
+    MIN_CLEARANCE rather than papered over with a fudge factor -- a made-up
+    multiplier tuned on this one turn would be wrong on every other geometry,
+    and wrong in the unsafe direction on a tighter one. The number this
+    returns is a lower bound on the path, which is the only honest thing a
+    one-arc model can be.
     """
     off = (math.pi - abs(bearing)) if behind else abs(bearing)
     off = min(off, math.pi / 2 - 1e-3)

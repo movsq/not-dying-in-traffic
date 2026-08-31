@@ -79,9 +79,10 @@
       color:var(--fg);border:1px solid var(--line);cursor:pointer" hidden>
       resume driving</button>
     <div class="hint" id="hint">
-      Reverts the record to the last commit marked reversible and brings the
-      vehicle to a controlled stop. Frames already committed to the world are
-      not among them.
+      Freezes the record at the last commit marked reversible and brings the
+      vehicle to a controlled stop. Frames after it are handed to the incident
+      tooling as suspect. Frames already committed to the world are not among
+      them.
     </div>
   </section>
 </main>
@@ -149,12 +150,18 @@ es.onmessage = e => {
 };
 
 // The dialog is not decoration. It is the last place a human sees the two
-// numbers that differ: what the record will roll back, and what the world will.
+// numbers that differ: how much of the record stops being trusted, and how
+// much of the drive gets taken back. Nothing here moves a ref -- the record
+// plane freezes where it is and the frames past the freeze point go to the
+// incident tooling -- so the sentence says freeze, not roll back. A dialog
+// that promised a rollback of the record and delivered a display flag would
+// be lying at the exact moment the operator is deciding.
 $('btn').onclick = () => {
   const behind = last ? (last.seq - last.last_good_seq) : 0;
   $('dlgbody').innerHTML =
-    '<p>Record plane: rolls back <b>' + behind + '</b> frame(s) to seq ' +
-    (last ? last.last_good_seq : '?') + '.</p>' +
+    '<p>Record plane: freezes at seq ' +
+    (last ? last.last_good_seq : '?') + ' — the <b>' + behind +
+    '</b> frame(s) after it are handed to the incident tooling as suspect.</p>' +
     '<p>Physical plane: rolls back <b>0 m</b>. The vehicle will run a ' +
     'minimal-risk manoeuvre and stop where it is.</p>';
   $('dlg').showModal();
@@ -191,14 +198,22 @@ $('yes').onclick = async () => {
 };
 
 $('resume').onclick = async () => {
-  let r;
+  let r, body;
   try {
     r = await fetch('/resume', {method:'POST', headers:{'X-Revert-Token': TOKEN}});
+    body = await r.json();
   } catch (err) {
     refused('resume request failed: ' + err);
     return;
   }
-  if (!r.ok) { refused('resume refused: HTTP ' + r.status); return; }
+  // Same rule as the halt above, and for the same reason: a refusal is valid
+  // JSON too. Checking only r.ok would let a body that says {ok:false} reload
+  // the page into a "driving again" view of a vehicle still halted.
+  if (!r.ok || !body.ok) {
+    refused('resume refused: ' +
+            (body && body.refused ? body.refused : 'HTTP ' + r.status));
+    return;
+  }
   location.reload();
 };
 
@@ -234,11 +249,18 @@ function unhalt() {
 // The button stays live and says why. Leaving it disabled after a refusal
 // meant the operator could not try again without reloading the page.
 function refused(why) {
-  halted = false;             // refused means nothing was halted; say so, and
-                              // do not let a reconnect claim HALTED afterwards
-  $('conn').textContent = 'halt REFUSED';
-  $('btn').disabled = false;
-  $('btn').textContent = BTN_LABEL;
-  $('hint').textContent = 'HALT REFUSED: ' + why;
+  // `halted` is not this tab's to clear. It records what the vehicle is
+  // doing, and a refusal only says THIS request had no effect -- the halt
+  // another tab performed is real and still held in the server's STATE.
+  // Clearing it unconditionally repainted "streaming @ 10 Hz" over a halted
+  // vehicle on the next reconnect, which is the display lying about the
+  // vehicle to the person holding the button. Only the refusal is ours to
+  // show.
+  $('conn').textContent = halted ? 'HALTED — request REFUSED' : 'REFUSED';
+  $('hint').textContent = 'REFUSED: ' + why;
+  if (!halted) {              // nothing is halted, so re-arm and let them retry
+    $('btn').disabled = false;
+    $('btn').textContent = BTN_LABEL;
+  }
 }
 </script>

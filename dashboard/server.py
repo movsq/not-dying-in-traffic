@@ -4,6 +4,15 @@ Read-only view onto the record plane plus two write endpoints. Runs in its own
 process; it is a display, and a display must not be able to stall a control
 loop no matter what it does.
 
+What this process actually drives: its own `Plant`, in a background thread,
+for display. There is no vehicle behind it and no git command anywhere in this
+file. The halt endpoint stops that simulated drive and freezes the *displayed*
+record state -- the seq the page shows as the last good one -- and hands the
+real record to the incident tooling in carctl. It moves no refs, writes no
+commits and reverts nothing. Saying otherwise on a safety display is the same
+defect as showing stale state as live: the operator would be told an operation
+happened that no code here performs.
+
 The write endpoints are guarded. A localhost bind is not access control: any
 page the operator has open in the same browser can POST to 127.0.0.1, and a
 plain form POST is a CORS simple request, so nothing preflights it and nothing
@@ -18,7 +27,7 @@ page that rebinds DNS to 127.0.0.1 could read both, so the guard that was
 described as blocking DNS rebinding was not on the requests being rebound.
 """
 from __future__ import annotations
-import json, os, queue, secrets, threading, time, http.server
+import errno, json, os, queue, secrets, threading, time, http.server
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from carctl.plant import Plant
@@ -109,6 +118,9 @@ def _drive_forever() -> None:
             time.sleep(0.2)
         plant, latched = Plant(), set()
         STATE["last_good_seq"] = 0     # new drive, new seq numbering
+        # Reset with the seq numbering, for the same reason: the door is a
+        # property of this drive's history, not of the process.
+        one_way_door = False
         for _ in range(180):
             if STATE["halted"]:
                 break
@@ -118,7 +130,16 @@ def _drive_forever() -> None:
             for i in fresh:
                 latched.add(i.kind)
             inc = fresh[0] if fresh else None
-            if f.reversible:
+            # The latch stops at the first one-way door and stays there. `!`
+            # means the history stops being invertible *from there on*, so the
+            # reversible frames after an irreversible one are not somewhere the
+            # record can be taken back to -- getting there would have to undo
+            # the curb strike on the way. Advancing past it (111, 118, 121...)
+            # offered the operator a rollback target that the project's own
+            # definition of the marker says does not exist.
+            if not f.reversible:
+                one_way_door = True
+            elif not one_way_door:
                 STATE["last_good_seq"] = f.seq
             _broadcast({
                 "seq": f.seq, "kmh": round(f.pose.v * 3.6, 1),
@@ -192,7 +213,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(403)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps({"ok": False, "refused": why}).encode())
+        # A HEAD response carries no body by definition; writing one here
+        # would leave bytes in the socket that the client counts as the start
+        # of the next response.
+        if self.command != "HEAD":
+            self.wfile.write(json.dumps({"ok": False, "refused": why}).encode())
 
     def _json(self, payload: dict) -> None:
         self.send_response(200)
@@ -262,6 +287,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # and all, to anyone who asked.
         self.send_error(404)
 
+    def do_HEAD(self):
+        # Same guard, same routes, headers only. Without this method
+        # BaseHTTPRequestHandler answered HEAD with its own 501 before
+        # _host_ok() ever ran -- a response carrying the Server and Date
+        # headers to any Host at all, which is exactly the read the guard
+        # above exists to refuse. It also announced the process to a rebound
+        # page that GET would have turned away.
+        why = self._host_ok()
+        if why:
+            self._deny(why); return
+        route = self._route()
+        if route in ("/", "/index.html"):
+            with open(os.path.join(HERE, "index.html"), "rb") as fh:
+                body = fh.read().replace(b"__REVERT_TOKEN__", TOKEN.encode())
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            # The length GET would have sent. A HEAD that lies about it is a
+            # HEAD nothing can use to decide whether to fetch the page.
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return                  # no body: that is the whole point of HEAD
+        self.send_error(404)
+
+    def _unsupported(self):
+        """Everything else: guarded first, then 405.
+
+        These went to the inherited 501 as well, so PUT/DELETE/OPTIONS from
+        any Host got a reply -- and OPTIONS in particular is what a browser
+        sends to probe. Nothing here is ever going to grow a PUT, so the
+        answer is Method Not Allowed rather than Not Implemented, and it is
+        only given to a caller that cleared the Host check.
+        """
+        why = self._host_ok()
+        if why:
+            self._deny(why); return
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        # 405 without Allow is an incomplete 405, and the list is the two
+        # methods this server has.
+        self.send_header("Allow", "GET, HEAD, POST")
+        self.end_headers()
+        self.wfile.write(json.dumps(
+            {"ok": False, "refused": f"method {self.command} not allowed"}
+        ).encode())
+
+    do_PUT = do_DELETE = do_OPTIONS = do_PATCH = _unsupported
+
     # ---- writes ------------------------------------------------------------
     def do_POST(self):
         # Authorisation first, routing second. The other order answered an
@@ -319,6 +392,32 @@ if __name__ == "__main__":
         # so the operator was left with no dashboard until they killed a PID.
         allow_reuse_address = (os.name != "nt")
 
-    with _Server(("127.0.0.1", PORT), Handler) as httpd:
-        print(f"dashboard on http://127.0.0.1:{PORT}")
-        httpd.serve_forever()
+    try:
+        server = _Server(("127.0.0.1", PORT), Handler)
+    except OSError as exc:
+        # The POSIX half of the WinError 10048 story in the README. There,
+        # reuse-on-Windows let a second launch silently shadow the first and
+        # the operator tested against the wrong build; here errno 98 refuses
+        # the bind instead, which is the right outcome reported as a
+        # ten-line traceback that reads like the dashboard crashed. It did
+        # not: the port is taken, almost always by the dashboard already
+        # running, and that is one line to say.
+        if exc.errno == errno.EADDRINUSE:
+            print(f"port {PORT} is already in use -- another dashboard is "
+                  f"probably still running. Stop it, or set PORT.",
+                  file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        raise
+    with server as httpd:
+        # flush=True: stdout to a pipe or a log file is block-buffered, so the
+        # one line telling the operator where the dashboard is sat in the
+        # buffer until the process exited. A readiness banner that arrives at
+        # shutdown is not a readiness banner.
+        print(f"dashboard on http://127.0.0.1:{PORT}", flush=True)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            # Ctrl-C is how this process is meant to be stopped. Ending a
+            # deliberate shutdown with a traceback trains the operator to
+            # ignore tracebacks from a safety display.
+            print("\ndashboard stopped", flush=True)

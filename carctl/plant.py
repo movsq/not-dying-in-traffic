@@ -381,10 +381,13 @@ class Plant:
         # Something is already occupying the space the planner steered into.
         # The excursion is what brings the car inside MIN_CLEARANCE of it, so
         # the near miss is downstream of the planner fault and prediction owns
-        # it. Without this, `collision` is the incident kind nothing triggers:
-        # a successful parallel park used to stand in for one, which is the
-        # false positive PARK_CLEARANCE exists to stop. The floor is the
-        # swerve back into lane: the car clears the van, barely.
+        # it. Without this, `collision` is the incident kind nothing triggers,
+        # and what stood in for one was not the park -- the park never gets
+        # inside 2.92 m of anything -- but the stationary frames after it,
+        # sitting 1.40 m off the bay van at walking pace and under. Those are
+        # the false positive safety.COLLISION_MIN_SPEED exists to stop; this
+        # is the real one it has to leave standing. The floor is the swerve
+        # back into lane: the car clears the van, barely.
         gap = VAN_S - self.s_along
         if 0 < gap <= 12.0:
             lidar = max(1.2, gap)

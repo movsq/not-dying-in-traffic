@@ -58,23 +58,21 @@ class Preconditions:
         return c
 
 
-# One id per process. The monotonic clock restarts at zero on every run, so a
-# delta between two processes' readings is a meaningless number that happens
-# to look entirely plausible. This is what tells the two cases apart.
-RUN_ID = uuid.uuid4().hex[:12]
-
-
 @dataclass
 class StashEntry:
     id: str
     ref: str
     seq: int
+    # Kept in the entry, never consulted by age_s. It is the simulated tick
+    # count -- useful for lining a stash up against the frame log, useless as
+    # an age. There is no RUN_ID beside it any more: it existed only to decide
+    # which of two clocks to believe, and there is one clock now. Entries
+    # written before this carry a run_id key, which list() drops as unknown.
     t_mono_ns: int
     return_pose: dict
     preconditions: dict
     attempt: int
     t_wall_s: int = 0
-    run_id: str = ""        # empty on entries written before this existed
 
 
 class ParkingStash:
@@ -102,7 +100,7 @@ class ParkingStash:
             raise RuntimeError(f"could not create {ref}: {r.stderr.strip()}")
         entry = StashEntry(
             id=sid, ref=ref, seq=f.seq, t_mono_ns=f.t_mono_ns,
-            t_wall_s=f.t_wall_s, run_id=RUN_ID,
+            t_wall_s=f.t_wall_s,
             return_pose={"x": f.pose.x, "y": f.pose.y,
                          "heading": f.pose.heading, "v": 0.0},
             preconditions=asdict(pre), attempt=attempt)
@@ -132,22 +130,29 @@ class ParkingStash:
         return sorted(entries, key=lambda e: e.seq)
 
     def age_s(self, entry: StashEntry, now: Frame) -> float:
-        """Monotonic time is per-process and restarts at zero, so an entry from
-        an earlier run always looked brand new and the TTL never fired. Wall
-        clock decides across processes; the monotonic clock still decides
-        within one drive, where it is the trustworthy one.
+        """One clock, always the wall clock.
 
-        "Same run" used to be inferred -- a positive monotonic delta under an
-        hour -- which is precisely what a restart also produces. A 44 s old
-        stash then reported 7.6 s and popped clean, replaying a parking plan
-        onto a street that had moved on. It is an identity check now.
+        t_mono_ns is not a clock, it is the tick count: simulated time, which
+        advances with the loop and stops when the loop does. So the "within one
+        drive, monotonic is the trustworthy one" branch was reading a stopwatch
+        that only runs while somebody is watching it. Inside one long-lived
+        process a stash an hour old by every real measure reported 2.0 s,
+        passed the freshness check and popped clean -- replaying a parking plan
+        onto a street that had moved on, which is the exact failure the TTL is
+        here to prevent, arriving through the branch that was supposed to be
+        the accurate one.
+
+        The identity check that picked between the two clocks is gone with it.
+        One clock that is always right beats two that need an arbitrator, and
+        the arbitrator was the part that kept being subtly wrong.
+
+        t_wall_s carries whole seconds, so the true age is somewhere in
+        [wall - 1, wall + 1] and a TTL wants the upper bound: truncating let a
+        45.9 s entry report 45.0 and slip under a 45 s expiry. That 1 s of
+        deliberate over-reading costs nothing against a 45 s TTL, which is the
+        other reason not to miss the finer clock -- at this resolution there is
+        nothing to miss.
         """
-        if entry.run_id and entry.run_id == RUN_ID:
-            return (now.t_mono_ns - entry.t_mono_ns) / 1e9
-        # Across processes only the wall clock means anything, and t_wall_s
-        # carries whole seconds, so the true age is somewhere in
-        # [wall - 1, wall + 1]. A TTL wants the upper bound: truncating let a
-        # 45.9 s entry report 45.0 and slip under a 45 s expiry.
         return float(now.t_wall_s - entry.t_wall_s) + 1.0
 
     def pop(self, entry: StashEntry, now: Frame, now_pre: Preconditions):

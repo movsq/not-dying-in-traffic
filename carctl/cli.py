@@ -1,16 +1,73 @@
 from __future__ import annotations
-import argparse, json, os, re, subprocess, sys
+import argparse, json, math, os, re, signal, subprocess, sys
 from . import (blame as blamemod, lineage as lineagemod, loop as loopmod,
                publish as pubmod, retain as retainmod, safety,
                stash as stashmod)
 from .plant import Plant
 from .stash import Preconditions
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Filled in by main(), per command, from the working directory. It used to be
+# derived from __file__, which answers "where is carctl installed?" -- a
+# question with nothing to do with which record this invocation is about.
+# After `pip install .` that answer was site-packages, and a drive crashed on
+# the first git call; run from a venv living inside some other checkout it was
+# that checkout, and the drive quietly wrote its frames into a repository
+# nobody was looking at, which is the worse of the two by a distance. The
+# README's contract is "whatever repo you run it from", and the working
+# directory is the only thing that says which one that is.
+REPO = ""
 
 
-def _git(*a):
-    return subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True, encoding="utf-8").stdout
+def _find_repo() -> str:
+    """The repository this invocation is about: the one containing cwd."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           cwd=os.getcwd(), capture_output=True, text=True,
+                           encoding="utf-8")
+    except OSError as exc:
+        sys.exit(f"carctl: cannot run git: {exc}")
+    if r.returncode != 0 or not r.stdout.strip():
+        # One line and no traceback. Standing in the wrong directory is an
+        # ordinary thing to get wrong at a shell prompt, and a stack trace
+        # through subprocess says nothing an operator can act on.
+        sys.exit("carctl: not inside a git repository (run from the repo the "
+                 "record should live in)")
+    return os.path.abspath(r.stdout.strip())
+
+
+class GitError(RuntimeError):
+    """A git command this tool needed did not succeed."""
+
+
+def _run_git(*a) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *a], cwd=REPO, capture_output=True,
+                          text=True, encoding="utf-8")
+
+
+def _git(*a) -> str:
+    """Run git and return its stdout, or raise.
+
+    The exit code used to be discarded, so "failed" and "had nothing to say"
+    were the same empty string. `carctl log` in a repository with no history
+    printed one blank line and exited 0: a report of nothing having happened,
+    manufactured out of not being able to look. Every caller here is asking
+    the repository a question, and a question that could not be put is not
+    answered by silence.
+    """
+    r = _run_git(*a)
+    if r.returncode != 0:
+        raise GitError(f"`git {' '.join(a)}` failed: "
+                       f"{r.stderr.strip() or f'exit {r.returncode}'}")
+    return r.stdout
+
+
+def _rev(rev: str) -> str:
+    """The sha `rev` resolves to, or "" if it does not resolve.
+
+    The one place a non-zero exit is an answer rather than a failure, which is
+    why it does not go through _git.
+    """
+    return _run_git("rev-parse", "--verify", "--quiet", rev).stdout.strip()
 
 
 def _commit_for_seq(seq: int) -> tuple[str, str]:
@@ -22,7 +79,16 @@ def _commit_for_seq(seq: int) -> tuple[str, str]:
     index landed inside a previous drive -- and that wrong sha was then
     blamed, and record-reverted, against a frame that had no incident. The
     Seq: trailer is already in every message; read it.
+
+    The two ways this fails are different problems and get different words: a
+    repository with no frame history at all needs a drive, while one whose
+    last drive was too short needs a longer one. "Run a drive at least 111
+    frames long" is unhelpful advice for a clone that has never driven.
     """
+    if not _rev("refs/heads/main"):
+        return "", ("refs/heads/main does not exist here, so there are no "
+                    "frames to resolve a seq against; run `carctl drive` "
+                    "first")
     out = _git("log", "--format=%H%x1f%B%x1e", "refs/heads/main")
     for entry in out.split("\x1e"):
         sha, _, body = entry.strip().partition("\x1f")
@@ -41,19 +107,64 @@ def _commit_for_seq(seq: int) -> tuple[str, str]:
                 f"refs/heads/main; run a drive at least {seq + 1} frames long")
 
 
+def _interrupt_on_sigterm(signum, frame):
+    """Make SIGTERM arrive as a Ctrl-C.
+
+    Default SIGTERM tears the interpreter down where it stands: the drain
+    thread never writes `done`, fast-import exits "stream ends early", every
+    frame since the last checkpoint -- up to CHECKPOINT_EVERY, so 5 s of
+    driving -- is lost, and retain's drive lock is left on disk for its full
+    expiry with no drive behind it. KeyboardInterrupt already has all of that
+    handled. `kill` is how an operator stops a drive on a vehicle with no
+    terminal attached, and it should not be the expensive way to do it.
+    """
+    raise KeyboardInterrupt
+
+
 def cmd_drive(args):
     seen = []
     def on_frame(f, inc):
         if inc:
             seen.append((f, inc))
-    rep = loopmod.drive(REPO, args.seconds, realtime=not args.fast,
-                        on_frame=on_frame)
+    # Installed for the drive and restored after it. A signal handler is
+    # process-global state, so leaving one behind would change how anything
+    # later in this process dies. Guarded twice over: SIGTERM does not exist
+    # on every platform CPython runs on, and signal() refuses to install
+    # anything off the main thread.
+    previous = None
+    if hasattr(signal, "SIGTERM"):
+        try:
+            previous = signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
+        except (OSError, ValueError):
+            previous = None
+    try:
+        rep = loopmod.drive(REPO, args.seconds, realtime=not args.fast,
+                            on_frame=on_frame)
+    except RuntimeError as exc:
+        # gitstore refuses outright to append frames onto a tip that is not a
+        # frame history, and reports a dead fast-import the same way. Both are
+        # conditions an operator fixes by running the command somewhere else;
+        # neither is served by a traceback.
+        sys.exit(f"carctl drive: {exc}")
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
     print(f"ticks           {rep.ticks}")
     print(f"committed       {rep.committed}")
     print(f"dropped frames  {rep.dropped}")
     print(f"promotions      {rep.promotions}   <- commits on {lineagemod.REF}")
-    print(f"deadline overruns {rep.overruns}")
-    print(f"max jitter      {rep.max_jitter_ms:.2f} ms")
+    if rep.realtime:
+        print(f"deadline overruns {rep.overruns}")
+        print(f"max jitter      {rep.max_jitter_ms:.2f} ms")
+    else:
+        # Not zeros. --fast schedules nothing against a deadline, so there was
+        # no deadline to miss and no jitter to measure -- and "0 overruns,
+        # 0.00 ms" is a clean bill of health on precisely the two numbers this
+        # loop is written the way it is in order to produce. A CI run printing
+        # it would look like the strongest possible evidence for the claim it
+        # never tested.
+        print("deadline overruns not measured (--fast)")
+        print("max jitter        not measured (--fast)")
     print(f"max submit cost {rep.max_submit_us:.1f} us   <- the loop's entire git bill")
     print(f"tagged as      {rep.tag or 'UNTAGGED'}")
     kinds = {}
@@ -63,6 +174,15 @@ def cmd_drive(args):
     for k, v in kinds.items():
         print(f"  {k:15s} first at seq {v[0].seq:4d}  {v[0].detail}")
         print(f"  {'':15s} owner: {v[0].subsystem}")
+    if rep.interrupted:
+        print(f"\ndrive cut short by a signal after {rep.ticks} tick(s) of a "
+              f"{args.seconds:g} s drive. Everything above is true of the "
+              "drive that happened, and it is tagged like any other.")
+        # 128 + SIGINT, the shell's convention for "ended by a signal".
+        # Exiting 0 here would tell a script that a drive it asked for ran to
+        # length when it did not, and the frames it is about to read are a
+        # prefix, not the drive.
+        sys.exit(130)
 
 
 def cmd_incident(args):
@@ -71,14 +191,20 @@ def cmd_incident(args):
     plant = Plant()
     hit = None
     now = None
-    # `f` outlives the loop, and with --seconds 0 (anything under 0.05) the
-    # body never runs at all, so the `now = f` below raised UnboundLocalError
-    # where "no incident" was the honest answer.
+    # `f` outlives the loop, and with anything under 0.05 s the body never
+    # runs at all, so the `now = f` below raised UnboundLocalError where "no
+    # incident" was the honest answer.
     f = None
     # round, not int, for the reason loop.py gives: int(2.9 / 0.1) is 28.
     for _ in range(round(args.seconds / 0.1)):
+        # Ground truth for THIS tick, read before step() advances the clock
+        # past it. Asked afterwards it answers for the next tick, and detect()
+        # gets (frame_i, truth_{i+1}). loop.drive and cmd_replay sample in the
+        # same order for the same reason; all three have to agree or this tool
+        # ends up explaining a drive that differs from the one that ran.
+        truth = plant.true_light()
         f = plant.step()
-        for inc in safety.detect(f, plant.true_light()):
+        for inc in safety.detect(f, truth):
             if inc.kind == args.kind and hit is None:
                 hit = (f, inc)
         if hit and f.seq == hit[0].seq + 8:
@@ -87,11 +213,19 @@ def cmd_incident(args):
     else:
         now = f
     if not hit:
+        # Exit 0, deliberately. A drive with no incident of this kind is a
+        # good drive, and asking about one is what this command is for: the
+        # question was put and answered. Only a question that could not be put
+        # is a failure, which is every branch below.
         print(f"no {args.kind} in this drive"); return
     frame, inc = hit
     csha, err = _commit_for_seq(frame.seq)
     if err:
-        print(err); return
+        # The incident is real and we cannot say which commit holds it, so
+        # nothing after this line -- blame, the revert verdict, the record
+        # revert -- can run at all. Printing the reason and exiting 0 put an
+        # unanswerable question and a clean answer on the same exit code.
+        sys.exit(f"carctl incident: {err}")
 
     print(f"INCIDENT  {inc.kind}  seq {inc.seq}  commit {csha[:10]}")
     print(f"  {inc.detail}")
@@ -117,6 +251,17 @@ def cmd_incident(args):
 
 
 def cmd_park(args):
+    # ParkingStash raises RuntimeError when it cannot anchor a stash -- no
+    # refs/heads/main to hang it off, or update-ref refusing the name. That is
+    # a repository this command cannot run in, which is one line of advice,
+    # not a traceback out of the middle of a demo.
+    try:
+        _park(args)
+    except RuntimeError as exc:
+        sys.exit(f"carctl park: {exc}")
+
+
+def _park(args):
     st = stashmod.ParkingStash(REPO)
     plant = Plant()
     for _ in range(125):
@@ -160,10 +305,13 @@ def cmd_lineage(args):
         print(msg)
         if not n:
             return
-    if _git("rev-parse", "--verify", "--quiet", lineagemod.REF).strip() == "":
-        print(f"{lineagemod.REF} does not exist. Seed it from the promotions "
-              f"already on main with:  carctl lineage --backfill")
-        return
+    if not _rev(lineagemod.REF):
+        # Non-zero: asked for the promotion history and there is none to show.
+        # The advice is the useful half, but a script that treats exit 0 as
+        # "here is the lineage" must not get one from a ref that is absent.
+        sys.exit(f"carctl lineage: {lineagemod.REF} does not exist. Seed it "
+                 "from the promotions already on main with:  "
+                 "carctl lineage --backfill")
     n = _git("rev-list", "--count", lineagemod.REF).strip()
     print(f"{lineagemod.REF}  {n} promotion(s), kept indefinitely")
     print()
@@ -186,6 +334,15 @@ def cmd_maintain(args):
         # surfaces here rather than at parse time. Exit non-zero: a
         # maintenance pass that did not run must not look like one that found
         # nothing to do.
+        #
+        # The report travels with the exception, and for a destructive
+        # partial failure it is the only account of how far the prune got --
+        # refs already deleted, boundary already written. Swallowing it here
+        # reduced "half pruned" to a one-line "maintain: ..." that read like a
+        # refusal, which is the exact confusion MaintenanceError.destructive
+        # exists to prevent.
+        for line in exc.report:
+            print(line)
         sys.exit(f"maintain: {exc}")
     for line in report:
         print(line)
@@ -198,7 +355,11 @@ def cmd_bisect(args):
     # tenth drive exists.
     tags = [name for _, name in retainmod._drive_tags(REPO)]
     if len(tags) < 2:
-        print("need at least two tagged drives"); return
+        # A bisect range is a pair of drive boundaries, so one drive is not a
+        # range and no script was emitted. Exit 0 said "here is your bisect"
+        # to a caller that got nothing.
+        sys.exit(f"carctl bisect: need at least two tagged drives to bisect "
+                 f"between; this repository has {len(tags)}")
     good, bad = args.good or tags[0], args.bad or tags[-1]
     print(f"{len(tags)} tagged drives, {good} .. {bad}")
     print()
@@ -270,12 +431,17 @@ def cmd_replay(args):
     plant = Plant(checkpoints)
     found = []
     for _ in range(seq + 1):
+        # Before the step, matching loop.drive and cmd_incident: step() ends
+        # by advancing plant.t, so the oracle asked afterwards describes the
+        # next tick. A bisect that judged frames against a world one tick
+        # ahead of them would be answering a question nobody asked.
+        truth = plant.true_light()
         f = plant.step()
         # Nothing past the frame under test counts. The loop bound already
         # says that, and the filter is what keeps it true of the answer rather
         # than of the loop: a bisect step must judge the commit it was handed,
         # not the crash that came four seconds after it.
-        found += [i for i in safety.detect(f, plant.true_light())
+        found += [i for i in safety.detect(f, truth)
                   if i.seq <= seq and args.kind in ("", i.kind)]
     what = args.kind or "incident"
 
@@ -301,7 +467,14 @@ def cmd_replay(args):
 
 
 def cmd_publish(args):
-    sha = pubmod.build_public_ref(REPO)
+    try:
+        sha = pubmod.build_public_ref(REPO)
+    except (pubmod.Unscrubbable, pubmod.AuditError,
+            subprocess.CalledProcessError, RuntimeError) as exc:
+        # A scrubber that could not scrub is the one failure this command
+        # must never round off: the ref it would have built is the thing
+        # about to leave the vehicle.
+        sys.exit(f"carctl publish: {exc}")
     n = _git("rev-list", "--count", "refs/heads/public").strip()
     print(f"refs/heads/public  {sha[:10]}  {n} commits")
     print("  poses snapped to 25 m, commit times rounded to the minute")
@@ -310,17 +483,86 @@ def cmd_publish(args):
     print("")
     print("  main   " + " ".join(l.strip() for l in before if '"x"' in l or '"y"' in l))
     print("  public " + " ".join(l.strip() for l in after if '"x"' in l or '"y"' in l))
+    print("")
+    # The gate runs whether or not we are pushing. --push decides where the
+    # ref goes, not whether anyone checked it: the bare form prints a sha, a
+    # commit count and a scrubbed pose, which reads as a clean result, and
+    # then said nothing at all about the audit. Someone reading that before
+    # copying the ref somewhere by hand has been shown every reassuring thing
+    # except the one that was actually checked. push() audits again before it
+    # pushes -- this does not stand in for that, it stops the plain form from
+    # being silent about it.
+    try:
+        problems = pubmod.audit(REPO)
+    except pubmod.AuditError as exc:
+        sys.exit(f"carctl publish: the audit could not complete, so nothing "
+                 f"about this ref has been established: {exc}")
+    if problems:
+        for problem in problems:
+            print(f"audit: {problem}")
+        sys.exit("carctl publish: audit failed; refs/heads/public is not "
+                 "publishable and was not pushed")
+    print("audit: clean")
+    # Lineage goes out with every push, so the plain form checks it too --
+    # same reasoning as above, applied to the ref whose "publishable by
+    # construction" story is the one that already failed once. Only when the
+    # ref exists: a repo that has never driven has nothing to check, and
+    # push() skips the refspec for it the same way.
+    if _rev(lineagemod.REF):
+        try:
+            lineage_problems = pubmod.audit_lineage(REPO)
+        except pubmod.AuditError as exc:
+            sys.exit(f"carctl publish: the lineage audit could not complete, "
+                     f"so nothing about that ref has been established: {exc}")
+        if lineage_problems:
+            for problem in lineage_problems:
+                print(f"audit: {problem}")
+            sys.exit("carctl publish: lineage audit failed; `carctl lineage "
+                     "--rebuild` rewrites the ref from main with the public "
+                     "identity")
+        print("audit: lineage clean")
     if not args.push:
-        print("")
         print("not pushed. to publish:  carctl publish --push")
         return
     ok, msg = pubmod.push(REPO)
-    print(("pushed" if ok else "push failed") + ": " + msg)
+    if not ok:
+        # Non-zero. A push that did not happen is the one outcome of this
+        # command a caller most needs to be able to detect without reading
+        # the words.
+        sys.exit(f"carctl publish: push failed, nothing left the vehicle: "
+                 f"{msg}")
+    print("pushed: " + msg)
 
 
 def cmd_log(args):
     print(_git("log", f"-n{args.n}", "--format=%h  %ad  %s",
                "--date=format:%H:%M:%S"))
+
+
+def _seconds(text: str) -> float:
+    """A drive length argparse will accept.
+
+    `type=float` took nan and inf, which float() parses without complaint, and
+    took 0 and -5. Each of those reached the loop and failed there or, worse,
+    did not: round(nan / DT) raises ValueError out of the middle of drive(),
+    inf raises OverflowError, and a non-positive length produced a drive of no
+    ticks that went on to tag the previous drive's tip as though it were its
+    own. All four are the same slip at a shell prompt, and argparse's own
+    error is where a bad flag value belongs -- before the drive lock is taken
+    and before fast-import is started.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a finite number of seconds")
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{value:g} is not a drive length; give a positive number of "
+            "seconds")
+    return value
 
 
 def main(argv=None):
@@ -339,7 +581,7 @@ def main(argv=None):
     # the car still rolling at ~9 km/h and retain.stationary(), which reads
     # the last committed frame's speed, can never pass after a default drive.
     # By 17 s it has settled to ~0.4 km/h.
-    d.add_argument("--seconds", type=float, default=17.0,
+    d.add_argument("--seconds", type=_seconds, default=17.0,
                    help="drive length; the default runs past the scripted "
                         "stop so the vehicle is stationary at the end, which "
                         "is what `carctl maintain` requires")
@@ -348,8 +590,16 @@ def main(argv=None):
     d.set_defaults(func=cmd_drive)
 
     i = sub.add_parser("incident")
-    i.add_argument("--kind", default="red_light_run")
-    i.add_argument("--seconds", type=float, default=14.0)
+    # Validated against the kinds that exist, rather than taken as free text.
+    # A typo matched nothing, and this command's honest answer for "nothing
+    # matched" is `no <kind> in this drive`, exit 0 -- so `--kind
+    # red_light_runn` reported a clean drive, confidently, on the tool whose
+    # entire job is finding the thing that went wrong. Being wrong quietly is
+    # bad enough anywhere; here it is the failure mode the command exists to
+    # rule out.
+    i.add_argument("--kind", default="red_light_run",
+                   choices=sorted(safety.OWNER))
+    i.add_argument("--seconds", type=_seconds, default=14.0)
     i.set_defaults(func=cmd_incident)
 
     k = sub.add_parser("park"); k.add_argument("--drop", action="store_true")
@@ -366,9 +616,10 @@ def main(argv=None):
     rp.add_argument("--assert-no-incident", action="store_true",
                     help="exit 1 if the replay hits one, 0 if it is clean; "
                          "what `git bisect run` reads")
-    # Validated against the kinds that exist, rather than taken as free text.
-    # A typo would otherwise match nothing, report every frame clean, and hand
-    # `git bisect run` a confident answer built out of a misspelling.
+    # Same validation as `incident --kind` and for the same reason, with one
+    # more consumer: an unmatched kind reports every frame clean and hands
+    # `git bisect run` a confident answer built out of a misspelling, which it
+    # then repeats across the whole range.
     rp.add_argument("--kind", default="", choices=sorted(safety.OWNER),
                     help="judge this incident kind only; red_light_run is "
                          "the one the checkpoint set decides, while collision "
@@ -412,7 +663,26 @@ def main(argv=None):
     l.set_defaults(func=cmd_log)
 
     a = p.parse_args(argv)
-    a.func(a)
+
+    global REPO
+    # Resolved per command, after parsing and before dispatch, so a bad flag
+    # is reported by argparse rather than by a repository lookup the command
+    # was never going to survive anyway.
+    #
+    # `replay` is the exception and has to stay one: `git bisect run` invokes
+    # it inside a checkout that git made, wherever it pleased, and it reads
+    # its whole input out of --dir. Requiring a repository would make it fail
+    # in exactly the situation it was written for, and the failure would be
+    # read as "bad commit".
+    if a.cmd != "replay":
+        REPO = _find_repo()
+    try:
+        a.func(a)
+    except GitError as exc:
+        # One line, non-zero. Every _git call is this tool asking the
+        # repository a question; a question that could not be put has no
+        # answer, and the exit code has to say so.
+        sys.exit(f"carctl {a.cmd}: {exc}")
 
 
 if __name__ == "__main__":
