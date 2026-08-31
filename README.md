@@ -546,7 +546,7 @@ origin main` is precisely the spelling that must not work. What remains is
 `carctl publish --push`, which audits first.
 
 The scrubbed `public` and the lineage ref have been pushed. A clone of this
-repository lands on the scrubbed copy as its `main`, which is what makes the
+repository carries the scrubbed copy as its `main`, which is what makes the
 clone safe to hand out, whoever holds it. Whether the repo is private or
 public lowers or raises the stakes but does not change the design. Publishing
 a drive stays a thing you type on purpose:
@@ -737,14 +737,12 @@ text-mode subprocess call names `encoding="utf-8"` explicitly, so a `LANG=C`
 shell cannot mangle the street names. The one version floor is `git` 2.32 for
 `repack --geometric`. Older git takes the full repack instead and says so.
 
-A fresh clone lands on `main`, which is drive data and contains no source.
-It is the scrubbed public copy, since that is what was published. The code is
-on `src`:
+A fresh clone lands on `src`, the code. The drive data is one branch over on
+`main`, the scrubbed public copy, since that is what was published:
 
 ```bash
 git clone https://github.com/movsq/not-dying-in-traffic.git
 cd not-dying-in-traffic
-git checkout src
 ```
 
 Then, from the repo root. On Linux, substitute `python3` if that is what your
