@@ -171,20 +171,24 @@ class Committer:
                 "it. Run carctl from the repository the record lives in, not "
                 "from the one the source lives in.")
 
-    def _seed_lineage(self) -> None:
-        """Adopt origin's lineage before anything reads the local ref.
+    def _seed_ref(self, local: str, consequence: str) -> None:
+        """Adopt the published copy of `local` before anything reads it.
 
         `git clone` materialises only HEAD's branch, so a clone of this repo
-        arrives with refs/remotes/origin/lineage and no refs/heads/lineage at
-        all. models_at() then found nothing in force: the first frame of the
-        first drive read as "record 4 checkpoints" rather than as the rollback
-        off the promoted checkpoint that it actually is, the promotion it
-        wrote rooted a second parallel lineage, and every promotion the fleet
-        had already published was orphaned by the act of driving once. blame
-        then answered from the provisional main path instead of the ref built
-        to outlive it.
+        arrives with remote-tracking refs and no local ones except the branch
+        it landed on. For lineage that meant models_at() found nothing in
+        force: the first frame of the first drive read as "record 4
+        checkpoints" rather than as the rollback off the promoted checkpoint
+        that it actually is, the promotion it wrote rooted a second parallel
+        lineage, and every promotion the fleet had already published was
+        orphaned by the act of driving once. Then clones started landing on
+        src instead of main, and the identical failure appeared one ref over:
+        no local refs/heads/main, so _need_from decided the ref was new,
+        fast-import rooted frame 0 of the drive on no history at all, and the
+        published record sat orphaned one tracking ref away. Same clone
+        shape, same fix, one method: whichever of the two refs is missing is
+        seeded from its published copy before anything decides what exists.
         """
-        local = self.lineage_ref.decode()
         if self._rev(local):
             return
         # `refs/remotes/origin/lineage` was hardcoded here, which made the
@@ -193,50 +197,60 @@ class Committer:
         # and quietly rooted a lineage parallel to the published one -- the
         # exact failure this method exists to prevent, reintroduced by a
         # spelling. Ask lineage which remote refs actually resolve instead.
-        candidates = lineage.remote_refs(self.repo)
+        candidates = lineage.remote_refs(self.repo, local)
+        if not candidates:
+            # No remote-tracking copies at all is not a fork in the making, it
+            # is a repo that has never had a remote -- a fresh git init, the
+            # normal birth of a record. Rooting quietly is correct there, and
+            # a warning on every first drive of every new repo would teach
+            # operators to ignore the warning that matters below.
+            return
         name = local.rsplit("/", 1)[-1]
         origin = f"refs/remotes/origin/{name}"
         if origin in candidates:
             # Still preferred when it is there. `origin` is what a clone calls
             # the place it came from, and a repo with several remotes has an
-            # answer to "whose lineage is this" that guessing does not.
+            # answer to "whose ref is this" that guessing does not.
             upstream = origin
         elif len(candidates) == 1:
             upstream = candidates[0]
         else:
-            # None of them, or several with no origin among them. Neither is a
-            # published lineage this drive can be sure it is continuing, and
-            # picking one at random is how a renamed remote roots the parallel
-            # lineage in the first place. Say so and root a local one, which is
-            # at least visibly a new lineage rather than a silent fork.
-            print(f"warning: no published lineage was found to continue "
-                  f"({len(candidates)} remote lineage ref(s) resolve, none of "
-                  f"them unambiguous); this drive's promotions will start a "
-                  f"lineage of their own")
+            # Several remotes, no origin among them. Not a published copy this
+            # drive can be sure it is continuing, and picking one at random is
+            # how a renamed remote roots the parallel history in the first
+            # place. Say so and root a local one, which is at least visibly
+            # new rather than a silent fork.
+            print(f"warning: {len(candidates)} remote copies of {name} "
+                  f"resolve and none is origin's; {consequence}")
             return
         seed = subprocess.run(["git", "update-ref", local, self._rev(upstream)],
                               cwd=self.repo, capture_output=True, text=True,
                               encoding="utf-8")
         if seed.returncode != 0:
-            # Not fatal -- the drive can still record its promotions -- but it
-            # is about to root a lineage parallel to the published one, and
-            # that is worth saying out loud rather than discovering later.
+            # Not fatal -- the drive still runs -- but the fork it is about to
+            # create is worth saying out loud rather than discovering later.
             print(f"warning: could not seed {local} from {upstream}: "
-                  f"{seed.stderr.strip()}; this drive's promotions will start "
-                  "a lineage of their own")
+                  f"{seed.stderr.strip()}; {consequence}")
 
     def start(self) -> None:
         # fast-import treats a ref it has not seen as new and roots the first
         # commit, which loses every previous drive. Continue the existing tip
         # explicitly so drives append into one history and bisect works across
         # them.
+        # Before the rev-parse below, or _need_from decides the wrong thing
+        # about a ref that exists one tracking ref away.
+        self._seed_ref(self.ref.decode(),
+                       "this drive will root a new record instead of "
+                       "appending to the published one")
         self._need_from = bool(self._rev(self.ref.decode()))
         if self._need_from:
             self._check_frame_tree()
         # Before models_at, not after: what the local ref says is the whole
         # input to the promotion decision, and on a fresh clone it says
         # nothing until this has run.
-        self._seed_lineage()
+        self._seed_ref(self.lineage_ref.decode(),
+                       "this drive's promotions will start a lineage of "
+                       "their own")
         # What the lineage ref already says is in force. Comparing against
         # this rather than against the first frame is what makes a checkpoint
         # swapped while the vehicle was parked show up as a promotion instead

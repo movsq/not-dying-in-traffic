@@ -762,9 +762,10 @@ kills the child mid-stream and costs the frames since the last checkpoint,
 and SIGTERM arrives as the same clean shutdown. An interrupted drive commits
 every frame it drove, prints its report, tags itself like any other, and
 exits 130 so a script can tell a prefix from the drive it asked for. The
-first drive on a clone also adopts origin's lineage ref before it reads it.
-A clone materialises only `main`, and driving once used to orphan every
-published promotion by rooting a second lineage next to it.
+first drive on a clone also adopts origin's `main` and lineage refs before it
+reads them. A clone materialises only the branch it lands on, which is `src`,
+and driving once used to orphan the published record and every published
+promotion by rooting fresh refs beside them.
 
 ```bash
 python -m carctl incident --kind red_light_run
