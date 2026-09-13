@@ -385,6 +385,36 @@ def ensure_push_safety(repo: str) -> list[str]:
             existing = fh.read()
     except OSError:
         existing = None
+    # Honouring core.hooksPath also means following it out of the repo. Set in
+    # ~/.gitconfig it names one directory every repository on the machine
+    # runs its hooks from, and this hook installed there refused
+    # `git push <remote> main` in all of them, each refusal claiming that
+    # repo's main was somebody's 10 Hz poses. The guard is about this repo, so
+    # it is only written inside this repo's own git dir. Anywhere else is the
+    # operator's to decide, and not armed until they do.
+    common = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                            cwd=repo, capture_output=True, text=True,
+                            encoding="utf-8")
+    gitdir = (os.path.realpath(os.path.join(repo, common.stdout.strip()))
+              if common.returncode == 0 and common.stdout.strip() else None)
+    hookdir = os.path.realpath(os.path.dirname(path))
+    try:
+        inside = (gitdir is not None
+                  and os.path.commonpath([gitdir, hookdir]) == gitdir)
+    except ValueError:          # two drives on Windows: certainly not inside
+        inside = False
+    if not inside:
+        where = os.path.dirname(path)
+        line = (f"core.hooksPath points at {where}, outside this repo, so the "
+                "pre-push guard is not installed: a hook there would refuse "
+                "pushes to main in every repository that shares it. "
+                "push.default refuses only the bare `git push`; "
+                "`git push origin main` from this repo is not guarded")
+        if existing == _PRE_PUSH_HOOK:
+            line += (f". {path} is a copy an earlier carctl installed there, "
+                     "and it applies to every repository using that "
+                     "directory; move it aside")
+        return warnings + [line]
     if existing is not None:
         if existing == _PRE_PUSH_HOOK:
             return warnings            # already ours, nothing to say
@@ -394,9 +424,9 @@ def ensure_push_safety(repo: str) -> list[str]:
         # because until it is dealt with the second guard is not armed.
         return warnings + [
             f"{path} already exists and was left alone, so the pre-push guard "
-            "is not armed; a push of refs/heads/main to the remote's main is "
-            "refused only by push.default. Move it aside and re-run, or add "
-            "the refusal to it by hand"]
+            "is not armed; push.default refuses only the bare `git push`, "
+            "and `git push origin main` from this repo is not guarded. Move "
+            "it aside and re-run, or add the refusal to it by hand"]
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as fh:

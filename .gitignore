@@ -1,6 +1,7 @@
 .control/
 __pycache__/
 .claude_trash/
+.local_trash/
 .venv/
 .idea/
 .vscode/

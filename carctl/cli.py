@@ -430,9 +430,14 @@ def cmd_bisect(args):
     print(blamemod.bisect_script(REPO, good, bad), end="")
     print()
     print("emitted, not run. bisecting a moving vehicle is not a thing.")
+    # This used to offer `python -m carctl` as the no-install alternative. At
+    # each step the working tree is a frame, not the source, so without the
+    # install there is nothing to import, the replay exits 1, and bisect reads
+    # exit 1 as "bad": every step condemned and a confident wrong answer.
     print("the script calls `carctl`, so it needs the package installed and "
-          "on PATH (pip install .); `python -m carctl` works the same way if "
-          "you would rather not.")
+          "on PATH (pip install .). `python -m carctl` is no way around that "
+          "here: at each step the working tree is a frame, not the source, "
+          "and a replay that cannot import reads to bisect as a bad commit.")
     print("`--kind red_light_run` narrows the assert to one incident kind; "
           "the bare form works too, because the obstacles are places in the "
           "world, and a replay that stops for the light never reaches them.")

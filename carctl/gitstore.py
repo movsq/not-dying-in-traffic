@@ -35,7 +35,31 @@ from .publish import PUBLIC_IDENT
 CHECKPOINT_EVERY = 50   # frames, 5 s of driving
 QUEUE_DEPTH = 512       # frames, about 51 s of backlog before we start dropping
 
-IDENT = b"not-dying-in-traffic <vsedlacek1337@gmail.com>"
+# Only for when git has no identity to give. A drive does not stop over who
+# signs its frames, and publish rewrites whichever one this turns out to be.
+FALLBACK_IDENT = b"not-dying-in-traffic <driver@localhost>"
+
+
+def operator_ident(repo: str) -> bytes:
+    """`Name <mail>` for whoever this repo's git says is committing.
+
+    This used to be a constant, the author's own address, so every clone that
+    drove signed its raw frames with somebody else's name. main is the
+    operator's private record, and the identity on it is the operator's --
+    which is also what makes publish's identity rewrite a real one on every
+    clone rather than only on the machine it was written on.
+
+    `git var` rather than reading user.email, because it is the identity git
+    itself would commit with: config, the GIT_COMMITTER_* environment and the
+    autodetected fallback, in git's own order. It prints a timestamp and zone
+    after the address, which fast-import wants from the frame instead.
+    """
+    r = subprocess.run(["git", "var", "GIT_COMMITTER_IDENT"], cwd=repo,
+                       capture_output=True, text=True, encoding="utf-8")
+    who = r.stdout.strip().rsplit(" ", 2)[0] if r.returncode == 0 else ""
+    if "\n" in who or not who.endswith(">") or "<" not in who:
+        return FALLBACK_IDENT
+    return who.encode()
 
 # FRAME_PATHS is imported, not restated. This is the side that has to
 # recognise a tree somebody else wrote, and it used to carry its own copy of
@@ -84,6 +108,7 @@ class Committer:
         self._stderr = None
         self._thread: threading.Thread | None = None
         self._proc: subprocess.Popen | None = None
+        self._ident = FALLBACK_IDENT
 
     # ---- control-loop side -------------------------------------------------
     def submit(self, frame: Frame) -> None:
@@ -257,6 +282,8 @@ class Committer:
         # of vanishing into the gap between two drives.
         self._models = lineage.models_at(self.repo, self.lineage_ref.decode())
         self._lineage_from = self._models is not None
+        # Once per drive, here, so the loop never pays for it.
+        self._ident = operator_ident(self.repo)
         # stderr goes to a file, not a pipe. Nothing reads a pipe until
         # communicate() at the very end, so a few hundred warning lines fill
         # the OS buffer, fast-import blocks writing stderr, stops reading
@@ -288,7 +315,7 @@ class Committer:
 
     def _emit(self, f: Frame) -> bytes:
         out = [b"commit " + self.ref + b"\n",
-               b"committer " + IDENT + b" %d " % f.t_wall_s
+               b"committer " + self._ident + b" %d " % f.t_wall_s
                + _tz_offset(f.t_wall_s) + b"\n",
                _data(msgen.message(f).encode())]
         if self._need_from:
@@ -321,15 +348,16 @@ class Committer:
         at it before deciding there is a promotion to write at all.
         """
         msg = lineage.message(changed, f.t_wall_s, self.drive_tag, f.seq)
-        # The fleet identity, not IDENT. lineage is the one ref designed to be
-        # pushed and then kept forever, so it has to be publishable by
-        # construction -- and construction is here, at the only place these
-        # commits are ever written. Scrubbing it afterwards is not available:
-        # rewriting an identity changes every sha on a ref whose whole value
-        # is that its shas are stable references from blame. publish.audit()
-        # checks for exactly this and would refuse the push, which is a late
-        # and useless place to learn it. main keeps IDENT deliberately: those
-        # frames carry a location feed and are never published.
+        # The fleet identity, not the operator's. lineage is the one ref
+        # designed to be pushed and then kept forever, so it has to be
+        # publishable by construction -- and construction is here, at the only
+        # place these commits are ever written. Scrubbing it afterwards is not
+        # available: rewriting an identity changes every sha on a ref whose
+        # whole value is that its shas are stable references from blame.
+        # publish.audit() checks for exactly this and would refuse the push,
+        # which is a late and useless place to learn it. main keeps the
+        # operator's deliberately: those frames carry a location feed and are
+        # never published.
         out = [b"commit " + self.lineage_ref + b"\n",
                b"committer " + PUBLIC_IDENT + b" %d " % f.t_wall_s
                + _tz_offset(f.t_wall_s) + b"\n",

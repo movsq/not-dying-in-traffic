@@ -4,6 +4,13 @@ A car whose state history is a git history. It commits every 100 ms, reverts
 when it does something wrong, blames a model checkpoint for the incident, and
 stashes a trajectory to try parallel parking twice.
 
+The blame is a real `git blame`. Each of the car's four subsystems runs a
+model checkpoint that can be swapped over the air mid-drive, and every frame
+records which ones were in force. When the car runs a red light, blame lands
+on the commit that installed the perception checkpoint which misread the
+light, five seconds earlier, and on the note saying it shipped without the
+testing its gate required.
+
 Most of it works. One part deliberately does not, and that part turned out to
 be the interesting one.
 
@@ -212,7 +219,7 @@ git blame ->
   subsystem                    perception
   models_json_line             3
   promoted_on_ref              refs/heads/lineage
-  promoted_in                  80448912994a3768d1092cec9e93a8cf7724df72
+  promoted_in                  f12e809b05706a61d8c0cd391e22f4729f1f5549
   promoted_at_unix             1788133336
   promoted_by_commit_subject   promote perception to ckpt-perception-2026.07.14-a91f
   checkpoint                   ckpt-perception-2026.07.14-a91f
@@ -267,8 +274,8 @@ in the middle of one. `carctl bisect` writes the script out and stops there:
 ```
 2 tagged drives, drive-0007 .. drive-0008
 
-git -C /home/fixed/not-dying-in-traffic bisect start drive-0008 drive-0007
-git -C /home/fixed/not-dying-in-traffic bisect run carctl replay --assert-no-incident
+git -C /home/you/not-dying-in-traffic bisect start drive-0008 drive-0007
+git -C /home/you/not-dying-in-traffic bisect run carctl replay --assert-no-incident
 
 emitted, not run. bisecting a moving vehicle is not a thing.
 ```
@@ -459,6 +466,10 @@ originally scrubbed only the blob, which accomplished nothing. The exact
 trajectory was sitting in the body of every commit right next to the coarsened
 one, and the committer email was on all 560 of them.
 
+The identity on `main` is whichever one the operator's git would commit
+with. For a while it was my own address, hardcoded, so every clone that drove
+signed its private frames with my name.
+
 Then it turned out I had not really scrubbed the blob either. The filter picked
 its scrubber by sniffing the shape of the JSON, and `sensors.json` has no
 `pose` key, so it was handed straight back. It reached `public` as literally
@@ -545,6 +556,16 @@ anything but `refs/heads/public` to the remote's `main`. Git's own error for
 origin main` is precisely the spelling that must not work. What remains is
 `carctl publish --push`, which audits first.
 
+The hook goes into this repository's own git directory and nowhere else. It
+used to follow `core.hooksPath` wherever it pointed, and set in
+`~/.gitconfig` that is one directory every repository on the machine shares.
+The first drive on a Linux box with a global hooks path installed the guard
+there, and from then on `git push origin main` was refused in every repo on
+it, each refusal explaining that this repo's `main` was exact 10 Hz poses.
+Now a hooks path outside the repo gets a warning that the second guard is not
+armed, and a leftover copy from the old behaviour is named so it can be moved
+aside.
+
 The scrubbed `public` and the lineage ref have been pushed. A clone of this
 repository carries the scrubbed copy as its `main`, which is what makes the
 clone safe to hand out, whoever holds it. Whether the repo is private or
@@ -584,7 +605,7 @@ one. The lineage ref has to stand alone, because the frame the promotion
 happened on will be gone:
 
 ```
-8044891  2026-08-31 01:42  promote perception to ckpt-perception-2026.07.14-a91f
+f12e809  2026-08-31 01:42  promote perception to ckpt-perception-2026.07.14-a91f
             perception ckpt-perception-2026.05.30-1e4d -> ckpt-perception-2026.07.14-a91f
             during drive-0006
 ```
